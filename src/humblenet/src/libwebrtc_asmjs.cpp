@@ -29,12 +29,27 @@ struct libwebrtc_context* libwebrtc_create_context( lwrtc_callback_function call
 		var ctx = $0;
 		libwebrtc.connections = new Map();
 		libwebrtc.channels = new Map();
+		libwebrtc.nextConnectionId = 1;
+		libwebrtc.nextChannelId = 1;
+		libwebrtc.next_id = function(counter) {
+			var next = this[counter];
+			if (!Number.isSafeInteger(next) || next < 1 || next > 0x7fffffff) {
+				return 0;
+			}
+			this[counter] = next + 1;
+			return next;
+		};
 		libwebrtc.on_event = Module.cwrap('libwebrtc_helper', 'number', ['number', 'number', 'number', 'number', 'number', 'number', 'number']);
 		libwebrtc.options = {};
 
 		libwebrtc.create = function() {
+			var connectionId = this.next_id("nextConnectionId");
+			if (!connectionId) {
+				return 0;
+			}
+
 			if (window.netConfig && window.netConfig.debug) {
-				console.log("[DEBUG] RTCPeerConnection created", JSON.stringify(this.options, null, 2));
+				console.log("[DEBUG] RTCPeerConnection created");
 			}
 			var connection = new RTCPeerConnection(this.options,null);
 			connection.trickle = true;
@@ -49,13 +64,18 @@ struct libwebrtc_context* libwebrtc_create_context( lwrtc_callback_function call
 			connection.onsignalingstatechange = this.on_signalstatechange;
 			connection.oniceconnectionstatechange = this.on_icestatechange;
 
-			connection.id = this.connections.size + 1;
+			connection.id = connectionId;
 
 			this.connections.set( connection.id, connection );
 
 			return connection;
 		};
 		libwebrtc.create_channel = function(connection, name) {
+			var channelId = this.next_id("nextChannelId");
+			if (!channelId) {
+				return 0;
+			}
+
 			var ordered = window.netConfig ? window.netConfig.ordered == true : false;
 			if (window.netConfig && window.netConfig.debug) {
 				console.log("[DEBUG] created channel", name, "ordered", ordered);
@@ -71,7 +91,7 @@ struct libwebrtc_context* libwebrtc_create_context( lwrtc_callback_function call
 			channel.onmessage = libwebrtc.on_channel_message;
 			channel.onerror = libwebrtc.on_channel_error;
 
-			channel._id = libwebrtc.channels.size+1;
+			channel._id = channelId;
 
 			libwebrtc.channels.set( channel._id, channel);
 
@@ -175,12 +195,20 @@ struct libwebrtc_context* libwebrtc_create_context( lwrtc_callback_function call
 			channel.user_data = socket;
 			channel.binaryType = 'arraybuffer';
 
+			var channelId = libwebrtc.next_id("nextChannelId");
+			if (!channelId) {
+				if (channel.readyState !== 'closed') {
+					channel.close();
+				}
+				return;
+			}
+
 			channel.onopen = libwebrtc.on_channel_accept;
 			channel.onclose = libwebrtc.on_channel_close;
 			channel.onmessage = libwebrtc.on_channel_message;
 			channel.onerror = libwebrtc.on_channel_error;
 
-			channel._id = libwebrtc.channels.size+1;
+			channel._id = channelId;
 
 			libwebrtc.channels.set( channel._id, channel);
 		};
@@ -222,23 +250,57 @@ struct libwebrtc_context* libwebrtc_create_context( lwrtc_callback_function call
 			this.close();
 		};
 		libwebrtc.on_channel_close = function(event){
+			var channel = this;
+			var channelId = channel._id;
+			var parent = channel.parent;
+			var parentId = parent ? parent.id : 0;
+			var userData = channel.user_data;
+
+			channel.onopen = undefined;
+			channel.onclose = undefined;
+			channel.onmessage = undefined;
+			channel.onerror = undefined;
+			channel.close();
+			libwebrtc.channels.delete(channelId);
+
 			var stack = stackSave();
 			// close channel //
-			libwebrtc.on_event(ctx, this.parent.id, this._id, 8, this.user_data, 0, 0);
+			libwebrtc.on_event(ctx, parentId, channelId, 8, userData, 0, 0);
 			stackRestore(stack);
 		};
 		libwebrtc.destroy = function() {
-			libwebrtc.connections.set( this.id, undefined );
+			var connection = this;
+			if (connection.destroyed) {
+				return;
+			}
+			connection.destroyed = true;
+			var connectionId = connection.id;
+			var userData = connection.user_data;
 
-			this.ondatachannel = undefined;
-			this.onicecandidate = undefined;
-			this.onsignalingstatechange = undefined;
-			this.oniceconnectionstatechange = undefined;
+			connection.ondatachannel = undefined;
+			connection.onicecandidate = undefined;
+			connection.onsignalingstatechange = undefined;
+			connection.oniceconnectionstatechange = undefined;
+			libwebrtc.channels.forEach(function(channel, channelId) {
+				if (channel.parent !== connection) {
+					return;
+				}
+
+				channel.onopen = undefined;
+				channel.onclose = undefined;
+				channel.onmessage = undefined;
+				channel.onerror = undefined;
+				channel.parent = undefined;
+				channel.user_data = undefined;
+				channel.close();
+				libwebrtc.channels.delete(channelId);
+			});
+			connection.close();
+			libwebrtc.connections.delete(connectionId);
 
 			// destroy (connection) //
-			libwebrtc.on_event(ctx, this.id, 0, 10, this.user_data, 0, 0);
-			this.close();
-			Module.out("Destroy webrtc: " + this.id );
+			libwebrtc.on_event(ctx, connectionId, 0, 10, userData, 0, 0);
+			Module.out("Destroy webrtc: " + connectionId );
 		};
 
 
@@ -316,6 +378,9 @@ void libwebrtc_set_ice_servers(struct libwebrtc_context* ctx, const struct libwe
 struct libwebrtc_connection* libwebrtc_create_connection_extended(struct libwebrtc_context* ctx, void* user_data) {
 	return (struct libwebrtc_connection*)EM_ASM_INT({
 		var connection = Module.__libwebrtc.create();
+		if( ! connection ) {
+			return 0;
+		}
 		connection.user_data = $0;
 		return connection.id;
 	}, user_data);
@@ -450,6 +515,9 @@ struct libwebrtc_data_channel* libwebrtc_create_channel( struct libwebrtc_connec
 		}else{
 			channel = Module.__libwebrtc.create_channel( connection, UTF8ToString($1) );
 		}
+		if( ! channel ) {
+			return 0;
+		}
 
 		return channel._id;
 
@@ -483,9 +551,7 @@ void libwebrtc_close_connection( struct libwebrtc_connection* channel ) {
 			return -1;
 		}
 
-		Module.__libwebrtc.connections.set( connection.id, undefined );
-
-		connection.close();
+		connection.destroy();
 
 	}, channel );
 }
@@ -497,9 +563,13 @@ void libwebrtc_close_channel( struct libwebrtc_data_channel* channel ) {
 			return -1;
 		}
 
-		Module.__libwebrtc.connections.set( channel.id, undefined );
-
+		var channelId = channel._id;
+		channel.onopen = undefined;
+		channel.onclose = undefined;
+		channel.onmessage = undefined;
+		channel.onerror = undefined;
 		channel.close();
+		Module.__libwebrtc.channels.delete(channelId);
 	}, channel );
 }
 

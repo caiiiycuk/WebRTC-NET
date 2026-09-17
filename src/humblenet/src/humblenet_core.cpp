@@ -821,6 +821,8 @@ ha_bool internal_p2p_register_protocol() {
 	callbacks.on_data = on_data;
 	callbacks.on_disconnect = on_disconnect;
 	callbacks.on_writable = on_writable;
+	// The fallback callback has an incompatible WASM signature.
+	callbacks.on_destroy = on_destroy;
 
 	internal_context_t* context = internal_init(  &callbacks );
 	if (context == NULL) {
