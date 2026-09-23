@@ -60,9 +60,9 @@ struct libwebrtc_context* libwebrtc_create_context( lwrtc_callback_function call
 			connection.ondatachannel = function(event) {
 				libwebrtc.on_datachannel(connection, event);
 			};
-			connection.onicecandidate = this.on_candidate;
-			connection.onsignalingstatechange = this.on_signalstatechange;
-			connection.oniceconnectionstatechange = this.on_icestatechange;
+			connection.onicecandidate = this.on_candidate.bind(connection);
+			connection.onsignalingstatechange = this.on_signalstatechange.bind(connection);
+			connection.oniceconnectionstatechange = this.on_icestatechange.bind(connection);
 
 			connection.id = connectionId;
 
@@ -86,10 +86,10 @@ struct libwebrtc_context* libwebrtc_create_context( lwrtc_callback_function call
 			channel.user_data = connection.user_data;
 			channel.binaryType = 'arraybuffer';
 
-			channel.onopen = libwebrtc.on_channel_connected;
-			channel.onclose = libwebrtc.on_channel_close;
-			channel.onmessage = libwebrtc.on_channel_message;
-			channel.onerror = libwebrtc.on_channel_error;
+			channel.onopen = libwebrtc.on_channel_connected.bind(channel);
+			channel.onclose = libwebrtc.on_channel_close.bind(channel);
+			channel.onmessage = libwebrtc.on_channel_message.bind(channel);
+			channel.onerror = libwebrtc.on_channel_error.bind(channel);
 
 			channel._id = channelId;
 
@@ -203,10 +203,10 @@ struct libwebrtc_context* libwebrtc_create_context( lwrtc_callback_function call
 				return;
 			}
 
-			channel.onopen = libwebrtc.on_channel_accept;
-			channel.onclose = libwebrtc.on_channel_close;
-			channel.onmessage = libwebrtc.on_channel_message;
-			channel.onerror = libwebrtc.on_channel_error;
+			channel.onopen = libwebrtc.on_channel_accept.bind(channel);
+			channel.onclose = libwebrtc.on_channel_close.bind(channel);
+			channel.onmessage = libwebrtc.on_channel_message.bind(channel);
+			channel.onerror = libwebrtc.on_channel_error.bind(channel);
 
 			channel._id = channelId;
 
