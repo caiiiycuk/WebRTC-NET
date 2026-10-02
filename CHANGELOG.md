@@ -1,0 +1,188 @@
+# Changelog
+
+Generated from repository tags. `v1.1.2` is the current `HEAD` version.
+Merge commits are omitted when they only duplicate the commits they merge.
+
+## v1.1.2 - 2026-10-02
+
+- cf87dca Fix WASM WebRTC close propagation
+- cd17097 bind WebRTC callbacks to their connection and channel owners
+
+## v1.1.1 - 2026-09-07
+
+- 7b5eda6 Fix peer server lookup response handling
+- fa69522 Fix POSIX timed mutex deadline
+- 84d40d8 Fix native websocket event loop lifecycle
+- 1bdef5c Preserve websocket signaling message boundaries
+- 3a71d70 Fix alias reconciliation after reconnect
+- 8744882 Detect stale signaling sessions
+- ff56670 Fix websocket connection failure cleanup
+- dc2d665 Fix native HumbleNet socket wakeup
+- f600b3e Fix alias reacquisition after reconnect
+- ef6826c Revert BoringSSL submodule to upstream commit
+
+## v1.1.0 - 2026-08-20
+
+- fd52402 Update README.md
+- 053e6ee Allow alias takeover when previous owner session is disconnected
+- 8d6eed2 Update docker docs
+- d58e305 bind incoming data channels to their connection
+- 1b8c145 fallback to netConfig if set_iceservers was not called, abort on empty ice servers config, warn if no turn
+
+## v1.0.0 - 2026-05-18
+
+- 55f5992 initial source checking for 1.0 opensource release
+- e44a289 add in editorconfig with our indentation styles
+- 0d3f68f adjust build folders for tools so final binary output does not conflict with the binary name in makefile generators.
+- 27dd338 Update README.md
+- ddbe120 Fix typo
+- 61e28e6 add in version number handling code and set the version to 1.0.0
+- e049725 add missing headerfile for test
+- ba32633 adjust ignored warning for BoringSSL build on Windows to support VS2015
+- baba72b add missing headers to hello world test for VS2015 compile
+- 56ea0bf remove accidently added file
+- c9fdfd6 update cmake to support CMake 3.9+
+- e6f71c5 fix webrtc Readme version
+- e26851e Typos
+- abbc9ac Fix typo: BidiractionalMap -> BidirectionalMap
+- 88fe4ba Add more typo fixes
+- e813ba6 update README with building instructions
+- 90a946e remove warnings as errors
+- ade9c8d fix V575 from PSV-Studio
+- 5ceb4fd fix V773 with PVS-Studio
+- bbdaf36 cmake: adjust build target to 10.9 so things build on newer macOS sdks
+- f5faca3 correct strcpy_s usage (non-portable)
+- 806d3bf tests: update test to not override os method
+- 626c272 cmake: test_webrtc only works for desktop
+- 0cf8b5e fix compilation issues in asmjs bits on newer emscripten
+- 641b0fd update asmjs code to work with latest emscripten
+- b35ef4d add in humblenet_loader_init method to allow specifying exact path to load humblenet
+- dcf31b0 updated editor config
+- 9ef7eae Upgrade to latest libwebsockets (compiles but untested)
+- 24a5912 replace deprecated emscripten runtime function "allocate" with "stackAlloc"
+- 31c5d29 Firefox "workarounds" were broken, delete them. Fixes connection in Chrome
+- 17f79db Disable logging every packet, too slow
+- 239ce54 Use unreliable DataChannel
+- 2bc0627 Fix humblenet_socket.h to be more transparent
+- ed0838c switch to https for submodules
+- 2f54e0d ignore .vscode
+- 2897546 Use Let's Encrypt in peer-server
+- 88e5b10 enable trickling
+- 0c9d972 delete redundant message framing and CRC
+- f9fc9f1 Add HTTP API to check if a hostname is connected
+- a0668dc build with static boringssl instead of shared openssl
+- 93fb1fa make the terrible cmake even worse to fix build
+- fe8d1fe actually support TURN servers for web
+- 62b2f6f fix trickle ICE in firefox by removing assert
+- 69e5cc9 fix webrtc in Safari. Remove obsolete workarounds for browser variation that no longer exists.
+- a9f06ef update flatbuffers to master - works!
+- f5c0ef3 enable pings to keep sockets alive
+- 8605fdb remove peer-server.sh
+- 93ffe3b fix firefox crash
+- 346ce8b remove redundant and probably broken datagram framing
+- dc0c9d3 remove logs for every packet
+- a823084 Fix failure to renew Let's Encrypt certs
+- 39df996 Create humblenet-linux.yml
+- 1155d0e Update README.md
+- 5a9cfa9 add docs
+- a9cccad add cloud.js-dos.com turn/stun
+- 0568dfe Update humblenet-linux.yml
+- f9ebeb4 Update humblenet-linux.yml
+- ae43eaf All targets compiles (linux)
+- efad463 Set CHANNELS = 0, cause channel filtering is not supported anymore
+- 7a4d82a Update build system
+- 19e001f Support both native & em builds
+- 166252c Implement AliasQuery
+- 2f99e8a Add jsapi library for emscripten
+- c6f6e07 Implement jsapi
+- 3d105cd add disconnect api
+- efa39e0 Add unregister alias function
+- a865b6e switch to release build
+- 846b9b4 Track rooms in database
+- d2bff38 Update humblenet-linux.yml
+- b050e8b Option to create ordered / unordered data channel
+- d755e60 Use external poll in LWS (needed for native support)
+- 93c2262 Update to microstack v0.10
+- f444bcd Fix compilation erros in microstack
+- 9c289de Update libwebsockets
+- 769e885 Cache alias query for one second
+- 8699c3a 443 -> 444
+- b40af76 Support for strict queries for alias
+- 2ce63df Workaround for segfault in emversion (need to investigate this)
+- f2214a7 Fix double socket destroy on ws connection error
+- 60eafd6 Update cmake to 3.6
+- bff7e70 set myPeerId to 0 if disconnected
+- 220f9fa Enable KEEPALIVE for websockets
+- 66c1110 Disable HTTP2
+- 1637d7b Reduce logging verbosity; print warning if room not found
+- 8b5c4b4 Remove gamedb concept
+- 028516f Rename game to catalog
+- ca0667e Remove catalog verification
+- a14309c Do not user MSG_BUFFERED when not RELIABLE_BUFFERED
+- f85af44 add support for libopenssl (only for testing purpose)
+- bdc44c9 rename action
+- 3dddfa9 Fix NPE in webrtc microstack
+- 5d6aab8 add shutdown option to humblenet js api
+- cd16148 Use find instead of forloop to lookup alias
+- 5e89186 Improve turn/stun server config define (support multiple servers)
+- 7a3dc13 catch unhadlen exception on addIceCandidate
+- 5920e3c Replace history with playtime table
+- e5b568b trying to fix letsencrypt issue
+- 758b64a trying to switch to certbot
+- 393e816 rename actions
+- 491f48a Good state for jsapi
+- 6dada2c Support for newer emscripten
+- 8b16ab6 Remove good domains; remove verbose error logging
+- bff6112 Option to get iceServers directly form js
+- 72f1f80 send rtc stats to top
+- 6d4a481 provide docker compose template for hosting coturn server
+- c63d45e Correct template
+- 121f1dc send turnsecret
+- 46bec1b add transport to template
+- a540f4a update ufw rule
+- b51ec47 default to 2hrs credential ttl
+- 0dfb98a update coturn docker
+- b0f10f0 Add Linux WebRTC migration planning docs
+- dafda6a Add Linux external WebRTC build skeleton
+- ec2c2a1 Add external WebRTC provider submodule
+- dec6965 Improve external WebRTC provider autodetection
+- 28cc5d8 Add helper targets for WebRTC provider build
+- 5afbd0e Allow external WebRTC bootstrap before install
+- e9a8e20 Implement modern Linux WebRTC backend skeleton
+- 6a0a67b Update WebRTC migration progress notes
+- e75563e Integrate external Linux WebRTC provider path
+- d597f08 Advance Linux WebRTC runtime integration
+- b4df0d9 Stabilize coturn relay allocation defaults.
+- ba0efd1 update coturn-docker readme
+- 7043a7a Add QUOTA to config
+- 542eb70 chromium-webrtc readme
+- 763a860 Consolidate WebRTC Chromium roadmap docs
+- 87b2969 Remove legacy Chromium WebRTC integration
+- a5f219e libwebrtc.so is required
+- 79e4d7e hs_select fix for native
+- f0018c6 Update WebRTC integration and build workflow
+- 29215a1 Remove SQLite support from peer server
+- 1cf2cf0 Reduce alias lookup logging
+- 3ddf0c9 Remove server ICE leftovers and signaling relay path
+- 1d35fcd Update Linux release workflows
+- 16abfb3 refactor args
+- 1702d7a Allow peer-server TLS cert paths via CLI
+- 46bcf66 Build jsapi in OpenSSL workflow
+- eab994a Publish OpenSSL artifacts on tags
+- 8c47cf3 Rebrand user-facing text to WebRTC-NET
+- 7549d36 Remove obsolete Chromium roadmap
+- 88cfe59 Remove CSharp bindings and demos
+- df06ffb Update peer-server TLS docs and stdout log flushing.
+- 11a5027 Rename jsapi target to webrtcnet
+- f75114d remove coturn todo
+- 4545d90 Reconnect Signlaling
+- cc29ca9 Separate app verbosity from libwebsockets logging.
+- 914bcb9 Return alias list for empty lookup requests.
+- cfd4aed Rename HumbleNet to webrtc; fix EM_ASM error
+- 285bc42 Fix logic error in blacklist code; reduce black list timeout ot 1s
+- 8e14685 Fix reconnect cleanup for established WebRTC channels.
+- c02af29 update user quota limits
+- 44c60eb decrease max-allocate-lifetime to 300
+- 0f75389 Add optional publish metadata fields
+- 38cf810 Add optional publish flag field
+- a3d3705 Include asmjs SDK sources in release artifacts
