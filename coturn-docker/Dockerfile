@@ -1,4 +1,4 @@
-FROM ghcr.io/caiiiycuk/coturn:4.18.0-1
+FROM ghcr.io/caiiiycuk/coturn:4.18.0-2
 
 USER root
 
