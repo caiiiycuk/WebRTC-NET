@@ -1,6 +1,6 @@
 # Coturn Docker — STUN / TURN / TURNS with Let's Encrypt
 
-Dockerized [coturn](https://github.com/coturn/coturn) server with automatic TLS certificate management via Let's Encrypt, and a browser-based latency test page.
+Dockerized [coturn](https://github.com/coturn/coturn) server (built from the [caiiiycuk/coturn](https://github.com/caiiiycuk/coturn) fork, see [Coturn base image](#coturn-base-image)) with automatic TLS certificate management via Let's Encrypt, and a browser-based latency test page.
 
 ## What's included
 
@@ -686,6 +686,21 @@ docker compose pull
 docker compose build --pull --no-cache
 docker compose up -d
 ```
+
+### Coturn base image
+
+`Dockerfile` builds on `ghcr.io/caiiiycuk/coturn:<coturn-ver>-<N>`, a prebuilt `linux/amd64` image of the [caiiiycuk/coturn](https://github.com/caiiiycuk/coturn) fork. Servers only download it; coturn is never compiled on the server. The fork sources are the `3rdparty/coturn` submodule of HumbleNet.
+
+Rule: the committed `3rdparty/coturn` submodule commit is the commit of the `release/<tag>` whose image is in `FROM`.
+
+Releasing a new image:
+
+1. Merge the changes into `master` of the fork.
+2. Tag and push: `git tag release/<coturn-ver>-<N> && git push origin release/<coturn-ver>-<N>`. The `Release image` workflow (`.github/workflows/release-image.yml` in the fork) builds `docker/coturn/debian/Dockerfile` and pushes `ghcr.io/caiiiycuk/coturn:<coturn-ver>-<N>`.
+3. Wait for the workflow to finish and check that `docker pull ghcr.io/caiiiycuk/coturn:<coturn-ver>-<N>` works without login (the package must be public).
+4. In HumbleNet, update `FROM` in `Dockerfile`, check out the tag in `3rdparty/coturn`, and commit both together.
+
+Updating servers: `git pull && docker compose build --pull && docker compose up -d`.
 
 ### Update certbot
 

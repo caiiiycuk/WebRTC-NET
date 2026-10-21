@@ -1,7 +1,6 @@
 # ── Network ────────────────────────────────────────────────────────
 listening-port=3478
 tls-listening-port=5349
-no-ipv6
 
 # ── Authentication (TURN REST API) ───────────────────────────────
 fingerprint
@@ -16,11 +15,8 @@ min-port=$RELAY_PORT_MIN
 max-port=$RELAY_PORT_MAX
 
 # ── TLS hardening ─────────────────────────────────────────────────
-no-tlsv1
-no-tlsv1_1
 cipher-list=ECDHE+AESGCM:ECDHE+CHACHA20:!aNULL:!MD5:!DSS
 ec-curve-name=prime256v1
-dh2066
 
 # ── Session limits ────────────────────────────────────────────────
 total-quota=$TOTAL_QUOTA
@@ -30,8 +26,6 @@ stale-nonce=600
 
 # ── Security ──────────────────────────────────────────────────────
 no-multicast-peers
-no-cli
-no-loopback-peers
 
 denied-peer-ip=0.0.0.0-0.255.255.255
 denied-peer-ip=10.0.0.0-10.255.255.255

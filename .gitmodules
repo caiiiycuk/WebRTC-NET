@@ -10,3 +10,6 @@
 [submodule "3rdparty/webrtc-native-build"]
 	path = 3rdparty/webrtc-native-build
 	url = git@github.com:caiiiycuk/webrtc-native-build.git
+[submodule "3rdparty/coturn"]
+	path = 3rdparty/coturn
+	url = git@github.com:caiiiycuk/coturn.git

@@ -1,9 +1,9 @@
-FROM coturn/coturn:4.9.0-r0
+FROM ghcr.io/caiiiycuk/coturn:4.18.0-1
 
 USER root
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends gettext-base curl && \
+    apt-get install -y --no-install-recommends gettext-base curl openssl && \
     rm -rf /var/lib/apt/lists/*
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
