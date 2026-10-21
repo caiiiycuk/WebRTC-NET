@@ -225,8 +225,9 @@ All settings are in the `.env` file:
 | `TOTAL_QUOTA`      | Maximum concurrent TURN allocations across the server                                                                                | `9000`        |
 | `USER_QUOTA`       | Maximum concurrent TURN allocations for one REST username                                                                            | `128`        |
 | `PUBLIC_IP`        | VPS public IP (auto-detected if empty)                                                                                               | *(auto)*     |
-| `PUBLISH_URL`      | URL to POST iceServers + traffic JSON to (empty = disabled)                                                                          | *(empty)*    |
-| `PUBLISH_INTERVAL` | Seconds between iceServers publications                                                                                              | `60`         |
+| `PUBLISH_URL`      | HTTPS URL to POST iceServers, traffic, and capacity JSON to (empty = disabled)                                                        | *(empty)*    |
+| `PUBLISH_INTERVAL` | Legacy setting, ignored. Publication period and total deadline are fixed at 5 seconds.                                               | `5`          |
+| `ADMISSION_LIMIT`  | Optional positive safe integer, at most positive TOTAL_QUOTA. Required when TOTAL_QUOTA=0.                                            | *(unset)*    |
 | `PUBLISH_LABEL`    | Optional label added to published JSON for backend-side identification                                                               | *(empty)*    |
 | `PUBLISH_FLAG`     | Optional flag added to published JSON                                                                                                | *(empty)*    |
 | `PUBLISH_MAX_TRAFFIC_GB` | Optional maximum traffic value in GB added to published JSON                                                                    | *(empty)*    |
@@ -234,7 +235,7 @@ All settings are in the `.env` file:
 
 ### Published JSON format
 
-When `PUBLISH_URL` is set, the entrypoint POSTs the following JSON every `PUBLISH_INTERVAL` seconds:
+When `PUBLISH_URL` is set, the entrypoint starts `publisher.py`, using only the Python standard library. It POSTs the following base JSON every 5 seconds:
 
 ```json
 {
@@ -258,7 +259,32 @@ When `PUBLISH_URL` is set, the entrypoint POSTs the following JSON every `PUBLIS
 
 The `traffic` object reports total bytes relayed by coturn (received + sent), tracked via coturn's built-in prometheus metrics. Counters reset at midnight (daily) and on the 1st of each month. Stats persist across container restarts via the `coturn-data` volume.
 
-`label`, `flag`, and `maxTrafficGb` are optional additive fields. They are included only when `PUBLISH_LABEL`, `PUBLISH_FLAG`, and `PUBLISH_MAX_TRAFFIC_GB` are set, so installations that leave all three variables empty keep publishing the legacy JSON shape unchanged.
+### Capacity publication and recovery
+
+The same local scrape reads `turn_quota_used{realm=DOMAIN}`, `turn_quota_limit{realm=DOMAIN,scope="total"}`, and the global `turn_observability_snapshot_timestamp_seconds`. The configured template binds metrics to `127.0.0.1`, not all host interfaces. The scrape has a 1 second total timeout and a 2 MiB body limit, including legacy families. The producer documents at most 1 MiB for the new observability families; legacy families share the remaining budget. A larger response disables capacity rather than truncating or inventing samples. Check this limit against each deployment's complete metrics response.
+
+Source seconds become `observedAtMs` by multiplying by 1000. Missing, duplicate, malformed, unready, regressing, more than 5 seconds old, or more than 2 seconds future samples disable capacity. Source total quota must equal the container's effective TOTAL_QUOTA. Empty or unset TOTAL_QUOTA retains the entrypoint fallback of 600; `.env.example` explicitly sets 9000. Unless ADMISSION_LIMIT is set, positive quotas use exact floor(TOTAL_QUOTA * 9 / 10). Empty or invalid explicit overrides never fall back. Unlimited quota requires a finite positive override. The 10% reserve is an operational choice, not a measured safe capacity.
+
+Before sending a new known watermark, the publisher atomically replaces and fsyncs `/var/lib/coturn/capacity_state.json` and its directory. It freezes the first tuple at that watermark. Repeats require a healthy source and unchanged admission configuration. Failures block that watermark until a strictly newer healthy source snapshot. Restart loses the frozen tuple and therefore starts with `unknown` at the durable attempted watermark. The state file is private and contains binding and attempted watermark, not the TURN secret. One publisher per state volume is enforced with a process lock.
+
+An existing file is required for known publication. Missing, corrupt, mismatched, or externally changed history fails closed, while legacy traffic and ICE publication can continue without capacity. Do not delete or reset state to recover an existing identity. Restore its durable attempted barrier after excluding all older publisher processes and all still-applicable POST requests. Reading Cloud's current watermark alone is insufficient because a pending POST may be newer. If this evidence is unavailable, leave capacity disabled. Rotating a secret does not reset history.
+
+Only for a genuinely new identity with no previous capacity attempts, initialize the state once while its publisher is stopped:
+
+```bash
+docker compose run --rm --no-deps --entrypoint python3 coturn \
+  /usr/local/bin/publisher.py --initialize-new-identity
+```
+
+The command refuses an existing file. Its use is an operator assertion that the identity has no previous capacity history, not an automatic recovery procedure. A fresh file or a missing Cloud row does not prove that assertion. Existing installations without capacity history need that assertion before their first known publication. Do not run this command for an identity whose state was lost.
+
+The additive wire field is either `{"capacity":{"version":1,"state":"known","realm":"turn.example.com","observedAtMs":1792584000000,"used":7,"totalLimit":600,"admissionLimit":540}}` or `{"capacity":{"version":1,"state":"unknown","realm":"turn.example.com","blockedThroughMs":1792584000000}}`. Without a reliable barrier the field is omitted, never replaced with a synthetic timestamp. Capacity failure does not remove TURN URLs or valid credentials. Credential generation failure retains the explicitly advertised STUN entry. Mandatory domain, TURN secret, and HTTPS configuration still apply.
+
+The 5 second budget covers scrape, parsing, durable writes, and POST. POST receives only the remaining budget, with no overlapping requests or catch-up queue. Blocking filesystem operations may finish late in the kernel; the expired cycle cannot then send a new POST. Logs contain only fixed failure reasons and HTTP status, never credentials or response bodies. Legacy PUBLISH_INTERVAL values are ignored.
+
+Run publisher checks with `python3 -m unittest -v test_publisher.py` from this directory. These checks do not establish deployed realm/configuration, old-client acceptance, or safe load limits.
+
+`label`, `flag`, and `maxTrafficGb` are optional additive fields. They are included only when `PUBLISH_LABEL`, `PUBLISH_FLAG`, and `PUBLISH_MAX_TRAFFIC_GB` are set. Leaving all three variables empty omits these metadata fields.
 
 The published `turnSecret` is intended for a trusted backend. Do not cache and serve the same generated `username`/`credential` pair to all browsers unless `USER_QUOTA` is sized for all concurrent allocations using that shared username. The safer production pattern is to mint a fresh REST username per client/session request.
 
@@ -543,7 +569,8 @@ docker compose up -d --force-recreate coturn
 - **Rate limiting**: The `/ping` endpoint is rate-limited to 10 req/s per IP with a burst of 20
 - **HSTS**: Strict-Transport-Security header is set on the HTTPS ping endpoint
 - **No CLI**: The coturn admin CLI is disabled
-- **Session limits**: Per-user quota of 32 concurrent allocations, 600 total
+- **Session limits**: `USER_QUOTA` concurrent allocations per user (default 128), `TOTAL_QUOTA` in total (default 9000)
+- **Metrics**: The coturn Prometheus endpoint listens only on `127.0.0.1:9641`
 
 ### Additional recommendations
 
@@ -582,10 +609,10 @@ coturn-certbot    running
 
 ### Live session count
 
-Coturn logs every allocation. Count active TURN sessions:
+Coturn exports the number of active TURN allocations as a metric on the host:
 
 ```bash
-docker compose logs coturn --since 5m 2>&1 | grep -c "allocation created"
+curl -s http://127.0.0.1:9641/metrics | grep '^turn_quota_used'
 ```
 
 ### Bandwidth monitoring

@@ -62,114 +62,13 @@ watch_certs() {
     done
 }
 
-# ── Traffic tracking via coturn prometheus metrics ────────────
-
-STATS_FILE="/var/lib/coturn/traffic_stats"
-PROMETHEUS_URL="http://localhost:9641/metrics"
-
-get_total_bytes() {
-    local metrics rcvb sentb
-    metrics=$(curl -fsS --connect-timeout 2 --max-time 5 "$PROMETHEUS_URL" 2>/dev/null) || return 1
-    echo "$metrics" | grep -qE '^turn_total_traffic_rcvb ' || return 1
-    echo "$metrics" | grep -qE '^turn_total_traffic_sentb ' || return 1
-    rcvb=$(echo "$metrics" | awk '/^turn_total_traffic_rcvb /{printf "%.0f", $2; exit}')
-    sentb=$(echo "$metrics" | awk '/^turn_total_traffic_sentb /{printf "%.0f", $2; exit}')
-    echo $(( ${rcvb:-0} + ${sentb:-0} ))
-}
-
-load_stats() {
-    LAST_TOTAL=0 DAILY_BYTES=0 MONTHLY_BYTES=0
-    CURRENT_DAY=$(date +%Y-%m-%d)
-    CURRENT_MONTH=$(date +%Y-%m)
-    [ -f "$STATS_FILE" ] && . "$STATS_FILE" || true
-}
-
-save_stats() {
-    cat > "$STATS_FILE" <<EOL
-LAST_TOTAL=$LAST_TOTAL
-DAILY_BYTES=$DAILY_BYTES
-MONTHLY_BYTES=$MONTHLY_BYTES
-CURRENT_DAY=$CURRENT_DAY
-CURRENT_MONTH=$CURRENT_MONTH
-EOL
-}
-
-update_traffic() {
-    local total_now today this_month delta
-    if ! total_now=$(get_total_bytes); then
-        echo "traffic-metrics: scrape failed or invalid, skipping update" >&2
-        return
-    fi
-    total_now=${total_now:-0}
-    today=$(date +%Y-%m-%d)
-    this_month=$(date +%Y-%m)
-
-    if [ "$today" != "$CURRENT_DAY" ]; then DAILY_BYTES=0; CURRENT_DAY="$today"; fi
-    if [ "$this_month" != "$CURRENT_MONTH" ]; then MONTHLY_BYTES=0; CURRENT_MONTH="$this_month"; fi
-
-    if [ "$total_now" -ge "$LAST_TOTAL" ] 2>/dev/null; then
-        delta=$((total_now - LAST_TOTAL))
-    else
-        delta=$total_now
-    fi
-
-    DAILY_BYTES=$((DAILY_BYTES + delta))
-    MONTHLY_BYTES=$((MONTHLY_BYTES + delta))
-    LAST_TOTAL=$total_now
-    save_stats
-}
-
-# ── Publish iceServers JSON to PUBLISH_URL every PUBLISH_INTERVAL seconds ─
-
-json_escape() {
-    local value="$1"
-    value="${value//\\/\\\\}"
-    value="${value//\"/\\\"}"
-    printf '%s' "$value"
-}
-
-publish_ice() {
-    local ttl="${CREDENTIAL_TTL:-300}"
-    echo "ice-publisher: -> $PUBLISH_URL every ${PUBLISH_INTERVAL}s"
-    load_stats
-    while true; do
-        update_traffic
-        local now expires username cred
-        now=$(date +%s)
-        expires=$((now + ttl))
-        username="${expires}:publisher:${now}"
-        cred=$(printf '%s' "$username" | openssl dgst -sha1 -hmac "$TURN_SECRET" -binary | base64)
-        local code publish_metadata
-        publish_metadata=""
-        if [ -n "$PUBLISH_LABEL" ]; then
-            publish_metadata="${publish_metadata},\"label\":\"$(json_escape "$PUBLISH_LABEL")\""
-        fi
-        if [ -n "$PUBLISH_FLAG" ]; then
-            publish_metadata="${publish_metadata},\"flag\":\"$(json_escape "$PUBLISH_FLAG")\""
-        fi
-        if [ -n "$PUBLISH_MAX_TRAFFIC_GB" ]; then
-            if [[ "$PUBLISH_MAX_TRAFFIC_GB" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-                publish_metadata="${publish_metadata},\"maxTrafficGb\":${PUBLISH_MAX_TRAFFIC_GB}"
-            else
-                echo "ice-publisher: invalid PUBLISH_MAX_TRAFFIC_GB=$PUBLISH_MAX_TRAFFIC_GB, omitting maxTrafficGb" >&2
-            fi
-        fi
-        code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 10 --max-time 30 -X POST \
-            -H "Content-Type: application/json" \
-            -d "{\"domain\":\"${DOMAIN}\",\"turnSecret\":\"${TURN_SECRET}\",\"iceServers\":[{\"urls\":[\"stun:${DOMAIN}:3478\"]},{\"urls\":[\"turn:${DOMAIN}:3478?transport=udp\",\"turn:${DOMAIN}:3478?transport=tcp\",\"turns:${DOMAIN}:5349?transport=tcp\"],\"username\":\"${username}\",\"credential\":\"${cred}\"}],\"traffic\":{\"dailyBytes\":${DAILY_BYTES},\"monthlyBytes\":${MONTHLY_BYTES}}${publish_metadata}}" \
-            "$PUBLISH_URL" 2>&1) || true
-        echo "ice-publisher: user=$username daily=${DAILY_BYTES}B monthly=${MONTHLY_BYTES}B -> HTTP $code"
-        sleep "${PUBLISH_INTERVAL:-60}"
-    done
-}
-
 mkdir -p /var/lib/coturn
 generate_config
 
 trap 'kill 0 2>/dev/null || true; wait 2>/dev/null || true; exit 0' TERM INT
 
 watch_certs &
-[ -n "$PUBLISH_URL" ] && publish_ice &
+[ -n "$PUBLISH_URL" ] && python3 /usr/local/bin/publisher.py &
 
 echo "Starting coturn..."
 while true; do
