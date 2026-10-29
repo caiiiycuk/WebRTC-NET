@@ -9,7 +9,7 @@ docker compose up -d
 
 docker compose stop coturn
 
-Убедитесь что PUBLISH_URL=https://cloud.dos.zone/cloud в .env
+Убедитесь что PUBLISH_URL=https://cloud.dos.zone/gulp в .env
 
 docker compose run --rm --no-deps --entrypoint python3 coturn \
   /usr/local/bin/publisher.py --initialize-new-identity
