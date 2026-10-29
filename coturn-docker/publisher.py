@@ -140,7 +140,7 @@ class Publisher:
         self.environment = environment
         self.stun_enabled = stun_enabled
         self.realm = environment["DOMAIN"]
-        self.binding = {"domain": self.realm, "publishUrl": environment["PUBLISH_URL"]}
+        self.binding = None
         self.state_path = directory / "capacity_state.json"
         self.stats_path = directory / "traffic_stats"
         self.attempted = 0
@@ -150,11 +150,17 @@ class Publisher:
         self.blocked = True
         try:
             state = json.loads(self.state_path.read_text())
-            if not isinstance(state, dict) or type(state.get("version")) is not int or state.get("version") != 1 or state.get("binding") != self.binding:
+            if not isinstance(state, dict) or type(state.get("version")) is not int or state.get("version") != 1:
+                raise ValueError("invalid state version")
+            binding = state["binding"]
+            # The saved publishUrl is history metadata; delivery uses the current PUBLISH_URL.
+            if (not isinstance(binding, dict) or binding.keys() != {"domain", "publishUrl"}
+                    or binding["domain"] != self.realm or not isinstance(binding["publishUrl"], str)):
                 raise ValueError("invalid state binding")
             attempted = state["attemptedThroughMs"]
             if type(attempted) is not int or not 0 <= attempted <= MAX_SAFE_INTEGER:
                 raise ValueError("invalid state barrier")
+            self.binding = binding
             self.attempted = attempted
             self.recovered = True
         except (OSError, ValueError, KeyError, TypeError):

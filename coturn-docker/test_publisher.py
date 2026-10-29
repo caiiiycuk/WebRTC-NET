@@ -22,6 +22,19 @@ def metrics(used="7", total="600", timestamp="1000", realm="turn.invalid"):
             f'turn_observability_snapshot_timestamp_seconds {timestamp}\n')
 
 
+POST_ONCE = '''
+import json, sys, urllib.request
+from pathlib import Path
+from publisher import Publisher
+publisher = Publisher(json.loads(sys.argv[1]), Path(sys.argv[2]), True)
+capacity = publisher.capacity(sys.argv[3], int(sys.argv[4]))
+request = urllib.request.Request(publisher.environment["PUBLISH_URL"],
+    data=json.dumps(publisher.payload(capacity, 1000)).encode(), method="POST")
+with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=8) as response:
+    assert response.status == 200
+'''
+
+
 class CapacityParserTests(unittest.TestCase):
     def test_limits(self):
         for total, expected in [("600", 540), ("9000", 8100), ("1000", 900), ("601", 540),
@@ -141,20 +154,9 @@ class PublisherTests(unittest.TestCase):
         environment = dict(self.environment, PUBLISH_URL=f"http://127.0.0.1:{server.server_port}/gulp")
         self.state_path.write_text(json.dumps({"version": 1, "binding": {
             "domain": environment["DOMAIN"], "publishUrl": environment["PUBLISH_URL"]}, "attemptedThroughMs": 0}))
-        code = '''
-import json, sys, urllib.request
-from pathlib import Path
-from publisher import Publisher
-publisher = Publisher(json.loads(sys.argv[1]), Path(sys.argv[2]), True)
-capacity = publisher.capacity(sys.argv[3], int(sys.argv[4]))
-request = urllib.request.Request(publisher.environment["PUBLISH_URL"],
-    data=json.dumps(publisher.payload(capacity, 1000)).encode(), method="POST")
-with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=8) as response:
-    assert response.status == 200
-'''
         for timestamp, expected in [("1000", "known"), ("1000", "unknown"), ("1001", "known")]:
             with self.subTest(timestamp=timestamp, expected=expected):
-                process = subprocess.Popen([sys.executable, "-B", "-c", code, json.dumps(environment),
+                process = subprocess.Popen([sys.executable, "-B", "-c", POST_ONCE, json.dumps(environment),
                                             str(self.directory), metrics(timestamp=timestamp), str(int(timestamp) * 1000)],
                                            cwd=Path(__file__).parent, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 try:
@@ -183,10 +185,82 @@ with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, 
         self.assertFalse(self.state_path.exists())
 
     def test_invalid_history_and_binding(self):
-        for state in ["null", "[]", "{}", '{"version":true}', '{"attemptedThroughMs":0}']:
+        def state_with(binding='{"domain":"turn.invalid","publishUrl":"https://cloud.invalid/gulp"}', attempted="0"):
+            return f'{{"version":1,"binding":{binding},"attemptedThroughMs":{attempted}}}'
+
+        for state in ["null", "[]", "{}", '{"version":true}', '{"attemptedThroughMs":0}',
+                      state_with(binding='"turn.invalid"'), state_with(binding="null"),
+                      state_with(binding='{"domain":"other.invalid","publishUrl":"https://cloud.invalid/gulp"}'),
+                      state_with(binding='{"domain":"turn.invalid","publishUrl":null}'),
+                      state_with(binding='{"domain":"turn.invalid"}'),
+                      state_with(binding='{"domain":"turn.invalid","publishUrl":"https://cloud.invalid/gulp","extra":1}'),
+                      state_with(attempted='"0"'), state_with(attempted="-1"), state_with(attempted="true"),
+                      state_with(attempted="1.0"), state_with(attempted=str(MAX_SAFE_INTEGER + 1))]:
             with self.subTest(state=state):
                 self.state_path.write_text(state)
                 self.assertIsNone(Publisher(self.environment, self.directory, True).capacity(metrics(), 1000000))
+                self.assertEqual(self.state_path.read_text(), state)
+
+    def test_history_survives_publish_url_change(self):
+        historic = {"domain": "turn.invalid", "publishUrl": "https://old.invalid/gulp"}
+        for attempted, first in [(0, "known"), (1000000, "unknown")]:
+            with self.subTest(attempted=attempted):
+                before = json.dumps({"version": 1, "binding": historic, "attemptedThroughMs": attempted})
+                self.state_path.write_text(before)
+                publisher = Publisher(self.environment, self.directory, True)
+                self.assertEqual(self.state_path.read_text(), before)
+                self.assertEqual(publisher.capacity(metrics(), 1000000)["state"], first)
+                self.assertEqual(publisher.capacity(metrics(timestamp="1001"), 1001000)["state"], "known")
+                self.assertEqual(publisher.capacity(metrics(timestamp="1002"), 1002000)["state"], "known")
+                self.assertEqual(json.loads(self.state_path.read_text()),
+                                 {"version": 1, "binding": historic, "attemptedThroughMs": 1002000})
+                restarted = Publisher(self.environment, self.directory, True)
+                self.assertEqual(restarted.capacity(metrics(timestamp="1002"), 1002000)["state"], "unknown")
+                self.assertEqual(restarted.capacity(metrics(timestamp="1003"), 1003000)["state"], "known")
+                self.assertEqual(json.loads(self.state_path.read_text())["binding"], historic)
+
+    def test_external_history_change_disables_known_regardless_of_url(self):
+        self.assertEqual(self.publisher.capacity(metrics(), 1000000)["state"], "known")
+        changed = json.loads(self.state_path.read_text())
+        changed["binding"]["publishUrl"] = "https://other.invalid/gulp"
+        self.state_path.write_text(json.dumps(changed))
+        self.assertIsNone(self.publisher.capacity(metrics(timestamp="1001"), 1001000))
+        self.assertIsNone(self.publisher.capacity(metrics(timestamp="1002"), 1002000))
+        self.assertEqual(json.loads(self.state_path.read_text()), changed)
+
+    def test_publish_url_change_sends_to_current_url_with_historic_binding(self):
+        requests = queue.Queue()
+        state_path = self.state_path
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                requests.put((payload, json.loads(state_path.read_text())))
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, format, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.addCleanup(server.server_close)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.shutdown)
+        environment = dict(self.environment, PUBLISH_URL=f"http://127.0.0.1:{server.server_port}/gulp")
+        historic = {"domain": "turn.invalid", "publishUrl": "https://old.invalid/gulp"}
+        self.state_path.write_text(json.dumps({"version": 1, "binding": historic, "attemptedThroughMs": 1000000}))
+        for timestamp, expected in [("1000", "unknown"), ("1001", "known"), ("1001", "unknown"), ("1002", "known")]:
+            with self.subTest(timestamp=timestamp, expected=expected):
+                completed = subprocess.run([sys.executable, "-B", "-c", POST_ONCE, json.dumps(environment), str(self.directory),
+                                            metrics(timestamp=timestamp), str(int(timestamp) * 1000)],
+                                           cwd=Path(__file__).parent, capture_output=True, text=True, timeout=10)
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                payload, persisted = requests.get(timeout=5)
+                self.assertEqual(payload["capacity"]["state"], expected)
+                self.assertEqual(persisted, {"version": 1, "binding": historic, "attemptedThroughMs": int(timestamp) * 1000})
+        self.assertTrue(requests.empty())
 
     def test_accounting_repeat_restart_rollover_and_failure(self):
         def traffic(received, sent):
