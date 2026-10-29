@@ -331,6 +331,49 @@ with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, 
         self.assertEqual(starts, [0, 12, 17])
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [0, 5])
 
+    def test_deadline_raised_outside_cycle_keeps_main_loop_running(self):
+        starts = []
+        written = []
+
+        def cycle(deadline):
+            starts.append(deadline)
+            if len(starts) == 1:
+                self.publisher.blocked = False
+                raise OSError("fixture POST failure")
+            self.assertTrue(self.publisher.blocked)
+            raise KeyboardInterrupt()
+
+        def write(text):
+            written.append(text)
+            if "cycle failed" in text:
+                raise TimeoutError("fixture deadline")
+
+        with (
+            patch.dict("publisher.os.environ", self.environment, clear=True),
+            patch("publisher.sys.argv", ["publisher.py"]),
+            patch("publisher.os.open", return_value=123),
+            patch("publisher.fcntl.flock"),
+            patch("publisher.Publisher", return_value=self.publisher),
+            patch.object(self.publisher, "cycle", side_effect=cycle),
+            patch("publisher.signal.signal"),
+            patch("publisher.signal.setitimer") as setitimer,
+            patch("publisher.cycle_clock", return_value=0),
+            patch("publisher.time.sleep") as sleep,
+            patch("publisher.sys.stderr") as stderr,
+        ):
+            stderr.write.side_effect = write
+            with self.assertRaises(KeyboardInterrupt):
+                main()
+        self.assertEqual(len(starts), 2)
+        self.assertIn("ice-publisher: cycle failed: OSError: fixture POST failure", written)
+        self.assertEqual([call.args for call in setitimer.call_args_list],
+                         [(signal.ITIMER_REAL, 5), (signal.ITIMER_REAL, 0), (signal.ITIMER_REAL, 5), (signal.ITIMER_REAL, 0)])
+        sleep.assert_not_called()
+        completed = subprocess.run([sys.executable, "-B", "publisher.py"], cwd=Path(__file__).parent, capture_output=True, text=True,
+                                   env={"PATH": "/usr/bin:/bin", "TURN_SECRET": "fixture-secret"}, timeout=10)
+        self.assertEqual(completed.returncode, 1)
+        self.assertEqual(completed.stderr, "ice-publisher: startup failed: ValueError: publisher requires domain and secret\n")
+
 
 if __name__ == "__main__":
     unittest.main()

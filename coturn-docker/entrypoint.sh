@@ -62,13 +62,50 @@ watch_certs() {
     done
 }
 
+# Restart the publisher 5 seconds after any exit until the container stops.
+# The trap kills the current child (publisher or pause) and ends the loop.
+run_publisher() {
+    local child="" stopping="" status
+    trap 'stopping=1; kill -TERM "$child" 2>/dev/null || true' TERM INT
+    while [ -z "$stopping" ]; do
+        python3 /usr/local/bin/publisher.py &
+        child=$!
+        [ -z "$stopping" ] || kill -TERM "$child" 2>/dev/null || true
+        status=0
+        wait "$child" || status=$?
+        # A trap interrupts wait before the child exits; wait again to reap it.
+        while kill -0 "$child" 2>/dev/null; do
+            status=0
+            wait "$child" || status=$?
+        done
+        if [ -n "$stopping" ]; then
+            break
+        fi
+        echo "publisher exited with status $status; restarting in 5 seconds" >&2
+        sleep 5 &
+        child=$!
+        [ -z "$stopping" ] || kill -TERM "$child" 2>/dev/null || true
+        wait "$child" || true
+    done
+}
+
+# SAFETY: kill 0 also signals this shell; ignore TERM/INT first, otherwise the
+# trap re-enters itself from wait until bash overflows its stack.
+stop_all() {
+    trap '' TERM INT
+    kill 0 2>/dev/null || true
+    wait 2>/dev/null || true
+}
+
 mkdir -p /var/lib/coturn
 generate_config
 
-trap 'kill 0 2>/dev/null || true; wait 2>/dev/null || true; exit 0' TERM INT
+trap 'stop_all; exit 0' TERM INT
 
 watch_certs &
-[ -n "$PUBLISH_URL" ] && python3 /usr/local/bin/publisher.py &
+if [ -n "$PUBLISH_URL" ]; then
+    run_publisher &
+fi
 
 echo "Starting coturn..."
 while true; do
@@ -80,6 +117,6 @@ while true; do
         continue
     fi
     echo "ERROR: turnserver exited unexpectedly" >&2
-    kill 0 2>/dev/null || true
+    stop_all
     exit 1
 done

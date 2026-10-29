@@ -334,21 +334,26 @@ def main():
 
     signal.signal(signal.SIGALRM, deadline_expired)
     while True:
-        started = cycle_clock()
-        signal.setitimer(signal.ITIMER_REAL, 5)
+        # SAFETY: the SIGALRM handler may raise after cycle() returned, inside
+        # the except/finally below or the pause; keep that inside the iteration.
         try:
-            publisher.cycle(started + 5)
-        except Exception:
+            started = cycle_clock()
+            signal.setitimer(signal.ITIMER_REAL, 5)
+            try:
+                publisher.cycle(started + 5)
+            except Exception as error:
+                publisher.blocked = True
+                print(f"ice-publisher: cycle failed: {type(error).__name__}: {error}", file=sys.stderr)
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+            time.sleep(max(0, started + 5 - cycle_clock()))
+        except TimeoutError:
             publisher.blocked = True
-            print("ice-publisher: cycle failed", file=sys.stderr)
-        finally:
-            signal.setitimer(signal.ITIMER_REAL, 0)
-        time.sleep(max(0, started + 5 - cycle_clock()))
 
 
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
-        print("ice-publisher: startup failed", file=sys.stderr)
+    except Exception as error:
+        print(f"ice-publisher: startup failed: {type(error).__name__}: {error}", file=sys.stderr)
         sys.exit(1)
