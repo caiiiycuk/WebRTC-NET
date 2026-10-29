@@ -123,9 +123,22 @@ def durable_write(path, body):
             os.unlink(temporary)
 
 
+def supports_stun(configuration, domain):
+    options = {}
+    for line in configuration.splitlines():
+        key, separator, value = line.partition("=")
+        key = key.strip()
+        if key in {"realm", "listening-port", "no-stun", "secure-stun", "no-udp"}:
+            options[key] = value.split("#", 1)[0].strip() if separator else ""
+    return (options.get("realm") == domain and options.get("listening-port", "3478") == "3478"
+            and all(options.get(flag, "false").lower() in {"0", "no", "false", "off"}
+                    for flag in ["no-stun", "secure-stun", "no-udp"]))
+
+
 class Publisher:
-    def __init__(self, environment, directory):
+    def __init__(self, environment, directory, stun_enabled):
         self.environment = environment
+        self.stun_enabled = stun_enabled
         self.realm = environment["DOMAIN"]
         self.binding = {"domain": self.realm, "publishUrl": environment["PUBLISH_URL"]}
         self.state_path = directory / "capacity_state.json"
@@ -226,9 +239,11 @@ class Publisher:
     def payload(self, capacity, now_seconds):
         domain = self.realm
         payload = {"domain": domain, "turnSecret": self.environment["TURN_SECRET"],
-                   "iceServers": [{"urls": [f"stun:{domain}:3478"]}],
+                   "iceServers": [],
                    "traffic": {"dailyBytes": self.stats["DAILY_BYTES"],
                                "monthlyBytes": self.stats["MONTHLY_BYTES"]}}
+        if self.stun_enabled:
+            payload["iceServers"].append({"urls": [f"stun:{domain}:3478"]})
         try:
             ttl = int(self.environment.get("CREDENTIAL_TTL") or "300")
             if ttl <= 0:
@@ -241,7 +256,7 @@ class Publisher:
                                                    f"turns:{domain}:5349?transport=tcp"],
                                           "username": username, "credential": credential})
         except (ValueError, OverflowError):
-            print("ice-publisher: TURN credentials unavailable; retaining STUN", file=sys.stderr)
+            print("ice-publisher: TURN credentials unavailable", file=sys.stderr)
         for variable, field in [("PUBLISH_LABEL", "label"), ("PUBLISH_FLAG", "flag")]:
             if self.environment.get(variable):
                 payload[field] = self.environment[variable]
@@ -307,7 +322,12 @@ def main():
         return
     if sys.argv[1:]:
         raise ValueError("unknown publisher argument")
-    publisher = Publisher(environment, directory)
+    try:
+        stun_enabled = supports_stun(Path("/etc/turnserver.conf").read_text(), environment["DOMAIN"])
+    except OSError:
+        stun_enabled = False
+        print("ice-publisher: STUN configuration unavailable; advertisement disabled", file=sys.stderr)
+    publisher = Publisher(environment, directory, stun_enabled)
 
     def deadline_expired(signum, frame):
         raise TimeoutError("cycle deadline")

@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from publisher import MAX_SAFE_INTEGER, METRICS_BODY_LIMIT, Publisher, admission_limit, capacity_snapshot, cycle_clock, main
+from publisher import MAX_SAFE_INTEGER, METRICS_BODY_LIMIT, Publisher, admission_limit, capacity_snapshot, cycle_clock, main, supports_stun
 
 
 def metrics(used="7", total="600", timestamp="1000", realm="turn.invalid"):
@@ -77,7 +77,7 @@ class PublisherTests(unittest.TestCase):
         self.state_path = self.directory / "capacity_state.json"
         self.state_path.write_text(json.dumps({"version": 1, "binding": {"domain": "turn.invalid",
                                    "publishUrl": self.environment["PUBLISH_URL"]}, "attemptedThroughMs": 0}))
-        self.publisher = Publisher(self.environment, self.directory)
+        self.publisher = Publisher(self.environment, self.directory, True)
 
     def test_freeze_failure_and_regression(self):
         first = self.publisher.capacity(metrics(), 1000000)
@@ -92,7 +92,7 @@ class PublisherTests(unittest.TestCase):
     def test_configuration_changes(self):
         for changes in [{"ADMISSION_LIMIT": "550"}, {"ADMISSION_LIMIT": "540"}, {"TOTAL_QUOTA": "600"}]:
             with self.subTest(changes=changes):
-                publisher = Publisher(self.environment.copy(), self.directory)
+                publisher = Publisher(self.environment.copy(), self.directory, True)
                 watermark = publisher.attempted // 1000 + 1000
                 self.assertEqual(publisher.capacity(metrics(timestamp=str(watermark)), watermark * 1000)["state"], "known")
                 publisher.environment.update(changes)
@@ -101,7 +101,7 @@ class PublisherTests(unittest.TestCase):
     def test_durable_barrier_before_send_restart_and_lost_ack(self):
         self.publisher.capacity(metrics(), 1000000)
         self.assertEqual(json.loads(self.state_path.read_text())["attemptedThroughMs"], 1000000)
-        restarted = Publisher(self.environment, self.directory)
+        restarted = Publisher(self.environment, self.directory, True)
         self.assertEqual(restarted.capacity(metrics(used="20"), 1000000)["state"], "unknown")
         self.assertEqual(restarted.capacity(metrics(timestamp="1001"), 1001000)["state"], "known")
         self.assertEqual(self.state_path.stat().st_mode & 0o777, 0o600)
@@ -145,7 +145,7 @@ class PublisherTests(unittest.TestCase):
 import json, sys, urllib.request
 from pathlib import Path
 from publisher import Publisher
-publisher = Publisher(json.loads(sys.argv[1]), Path(sys.argv[2]))
+publisher = Publisher(json.loads(sys.argv[1]), Path(sys.argv[2]), True)
 capacity = publisher.capacity(sys.argv[3], int(sys.argv[4]))
 request = urllib.request.Request(publisher.environment["PUBLISH_URL"],
     data=json.dumps(publisher.payload(capacity, 1000)).encode(), method="POST")
@@ -178,7 +178,7 @@ with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, 
         self.publisher.capacity(metrics(), 1000000)
         self.state_path.unlink()
         self.assertIsNone(self.publisher.capacity(metrics(timestamp="1001"), 1001000))
-        restarted = Publisher(self.environment, self.directory)
+        restarted = Publisher(self.environment, self.directory, True)
         self.assertIsNone(restarted.capacity(metrics(timestamp="1002"), 1002000))
         self.assertFalse(self.state_path.exists())
 
@@ -186,14 +186,14 @@ with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, 
         for state in ["null", "[]", "{}", '{"version":true}', '{"attemptedThroughMs":0}']:
             with self.subTest(state=state):
                 self.state_path.write_text(state)
-                self.assertIsNone(Publisher(self.environment, self.directory).capacity(metrics(), 1000000))
+                self.assertIsNone(Publisher(self.environment, self.directory, True).capacity(metrics(), 1000000))
 
     def test_accounting_repeat_restart_rollover_and_failure(self):
         def traffic(received, sent):
             return f"turn_total_traffic_rcvb {received}\nturn_total_traffic_sentb {sent}\n"
         self.publisher.update_traffic(traffic(100, 200), "2026-10-31")
         self.publisher.update_traffic(traffic(100, 200), "2026-10-31")
-        restarted = Publisher(self.environment, self.directory)
+        restarted = Publisher(self.environment, self.directory, True)
         restarted.update_traffic(traffic(150, 200), "2026-10-31")
         self.assertEqual(restarted.stats["DAILY_BYTES"], 350)
         restarted.update_traffic(traffic(175, 200), "2026-11-01")
@@ -216,6 +216,29 @@ with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, 
         self.assertEqual(payload["iceServers"][1]["username"], "1300:publisher:1000")
         self.environment["CREDENTIAL_TTL"] = "invalid"
         self.assertEqual(self.publisher.payload(None, 1000)["iceServers"], [payload["iceServers"][0]])
+
+    def test_listener_modes_never_advertise_unsupported_stun(self):
+        configuration = "realm=turn.invalid\nlistening-port=3478\n"
+        self.assertTrue(supports_stun(configuration, "turn.invalid"))
+        for flag in ["no-stun", "secure-stun", "no-udp"]:
+            for value in [flag, flag + "=true", flag + "=1", flag + "=yes", flag + "=on"]:
+                with self.subTest(value=value):
+                    self.assertFalse(supports_stun(configuration + value, "turn.invalid"))
+            self.assertTrue(supports_stun(configuration + flag + "=false # disabled", "turn.invalid"))
+        for body in ["", "realm=other.invalid", configuration + "listening-port=3479"]:
+            self.assertFalse(supports_stun(body, "turn.invalid"))
+        publisher = Publisher(self.environment, self.directory, False)
+        self.assertEqual(len(publisher.payload(None, 1000)["iceServers"]), 1)
+        self.assertTrue(publisher.payload(None, 1000)["iceServers"][0]["urls"][0].startswith("turn:"))
+        self.environment["CREDENTIAL_TTL"] = "invalid"
+        self.assertEqual(publisher.payload(None, 1000)["iceServers"], [])
+
+    def test_missing_auth_or_non_https_never_starts_publisher(self):
+        for change in [{"DOMAIN": ""}, {"TURN_SECRET": ""}, {"PUBLISH_URL": "http://cloud.invalid/gulp"}]:
+            with self.subTest(change=change), patch.dict("publisher.os.environ", dict(self.environment, **change), clear=True), patch("publisher.Publisher") as start:
+                with self.assertRaises(ValueError):
+                    main()
+                start.assert_not_called()
 
     def cycle_response(self, body):
         response = MagicMock()
