@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from publisher import MAX_SAFE_INTEGER, METRICS_BODY_LIMIT, Publisher, admission_limit, capacity_snapshot, cycle_clock, main, supports_stun
+from publisher import MAX_SAFE_INTEGER, METRICS_BODY_LIMIT, Publisher, admission_limit, capacity_snapshot, cycle_clock, durable_write, main, supports_stun
 
 
 def metrics(used="7", total="600", timestamp="1000", realm="turn.invalid"):
@@ -179,7 +179,8 @@ class PublisherTests(unittest.TestCase):
     def test_lost_history_never_uses_cloud_hwm_or_wall_time(self):
         self.publisher.capacity(metrics(), 1000000)
         self.state_path.unlink()
-        self.assertIsNone(self.publisher.capacity(metrics(timestamp="1001"), 1001000))
+        self.assertEqual(self.publisher.capacity(metrics(timestamp="1001"), 1001000)["blockedThroughMs"], 1000000)
+        self.assertFalse(self.state_path.exists())
         restarted = Publisher(self.environment, self.directory, True)
         self.assertIsNone(restarted.capacity(metrics(timestamp="1002"), 1002000))
         self.assertFalse(self.state_path.exists())
@@ -227,6 +228,57 @@ class PublisherTests(unittest.TestCase):
         self.assertIsNone(self.publisher.capacity(metrics(timestamp="1001"), 1001000))
         self.assertIsNone(self.publisher.capacity(metrics(timestamp="1002"), 1002000))
         self.assertEqual(json.loads(self.state_path.read_text()), changed)
+
+    def test_deadline_in_history_read_or_after_write_keeps_history(self):
+        self.assertEqual(self.publisher.capacity(metrics(), 1000000)["state"], "known")
+        with patch.object(Path, "read_text", side_effect=TimeoutError("fixture deadline")):
+            with self.assertRaises(TimeoutError):
+                self.publisher.capacity(metrics(timestamp="1001"), 1001000)
+        self.assertEqual(self.publisher.capacity(metrics(timestamp="1001"), 1001000)["state"], "known")
+
+        def interrupted_write(path, body):
+            durable_write(path, body)
+            raise TimeoutError("fixture deadline")
+
+        with patch("publisher.durable_write", side_effect=interrupted_write):
+            with self.assertRaises(TimeoutError):
+                self.publisher.capacity(metrics(timestamp="1002"), 1002000)
+        self.assertEqual(json.loads(self.state_path.read_text())["attemptedThroughMs"], 1002000)
+        self.assertEqual(self.publisher.attempted, 1001000)
+        self.assertEqual(self.publisher.capacity(metrics(timestamp="1002"), 1002000),
+                         {"version": 1, "state": "unknown", "realm": "turn.invalid", "blockedThroughMs": 1002000})
+        self.assertEqual(self.publisher.capacity(metrics(timestamp="1003"), 1003000)["state"], "known")
+
+    def test_history_barrier_moves_only_forward(self):
+        self.assertEqual(self.publisher.capacity(metrics(), 1000000)["state"], "known")
+        saved = json.loads(self.state_path.read_text())
+        self.state_path.write_text(json.dumps(dict(saved, attemptedThroughMs=1002000)))
+        with patch("publisher.sys.stderr", new_callable=io.StringIO) as stderr:
+            self.assertEqual(self.publisher.capacity(metrics(timestamp="1001"), 1001000),
+                             {"version": 1, "state": "unknown", "realm": "turn.invalid", "blockedThroughMs": 1002000})
+            self.assertEqual(self.publisher.capacity(metrics(timestamp="1003"), 1003000)["state"], "known")
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(json.loads(self.state_path.read_text())["attemptedThroughMs"], 1003000)
+        other = dict(saved["binding"], publishUrl="https://other.invalid/gulp")
+        for state in [dict(saved, attemptedThroughMs=1002000), dict(saved, binding=other, attemptedThroughMs=1003000)]:
+            with self.subTest(state=state), patch("publisher.sys.stderr", new_callable=io.StringIO) as stderr:
+                publisher = Publisher(self.environment, self.directory, True)
+                self.assertEqual(publisher.attempted, 1003000)
+                self.state_path.write_text(json.dumps(state))
+                self.assertIsNone(publisher.capacity(metrics(timestamp="1004"), 1004000))
+                self.assertIsNone(publisher.capacity(metrics(timestamp="1005"), 1005000))
+                self.assertEqual(json.loads(self.state_path.read_text()), state)
+                self.assertEqual(stderr.getvalue(), "ice-publisher: capacity history unavailable: ValueError: capacity history changed\n")
+                self.state_path.write_text(json.dumps(dict(saved, attemptedThroughMs=1003000)))
+
+    def test_transient_history_read_error_blocks_one_cycle(self):
+        self.assertEqual(self.publisher.capacity(metrics(), 1000000)["state"], "known")
+        with patch.object(Path, "read_text", side_effect=OSError("fixture read failure")), patch("publisher.sys.stderr", new_callable=io.StringIO) as stderr:
+            self.assertEqual(self.publisher.capacity(metrics(timestamp="1001"), 1001000),
+                             {"version": 1, "state": "unknown", "realm": "turn.invalid", "blockedThroughMs": 1000000})
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(json.loads(self.state_path.read_text())["attemptedThroughMs"], 1000000)
+        self.assertEqual(self.publisher.capacity(metrics(timestamp="1001"), 1001000)["state"], "known")
 
     def test_publish_url_change_sends_to_current_url_with_historic_binding(self):
         requests = queue.Queue()

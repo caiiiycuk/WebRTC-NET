@@ -123,6 +123,21 @@ def durable_write(path, body):
             os.unlink(temporary)
 
 
+def capacity_state(path, realm):
+    state = json.loads(path.read_text())
+    if not isinstance(state, dict) or type(state.get("version")) is not int or state.get("version") != 1:
+        raise ValueError("invalid state version")
+    binding = state.get("binding")
+    # The saved publishUrl is history metadata; delivery uses the current PUBLISH_URL.
+    if (not isinstance(binding, dict) or binding.keys() != {"domain", "publishUrl"}
+            or binding["domain"] != realm or not isinstance(binding["publishUrl"], str)):
+        raise ValueError("invalid state binding")
+    attempted = state.get("attemptedThroughMs")
+    if type(attempted) is not int or not 0 <= attempted <= MAX_SAFE_INTEGER:
+        raise ValueError("invalid state barrier")
+    return binding, attempted
+
+
 def supports_stun(configuration, domain):
     options = {}
     for line in configuration.splitlines():
@@ -149,21 +164,9 @@ class Publisher:
         self.config = None
         self.blocked = True
         try:
-            state = json.loads(self.state_path.read_text())
-            if not isinstance(state, dict) or type(state.get("version")) is not int or state.get("version") != 1:
-                raise ValueError("invalid state version")
-            binding = state["binding"]
-            # The saved publishUrl is history metadata; delivery uses the current PUBLISH_URL.
-            if (not isinstance(binding, dict) or binding.keys() != {"domain", "publishUrl"}
-                    or binding["domain"] != self.realm or not isinstance(binding["publishUrl"], str)):
-                raise ValueError("invalid state binding")
-            attempted = state["attemptedThroughMs"]
-            if type(attempted) is not int or not 0 <= attempted <= MAX_SAFE_INTEGER:
-                raise ValueError("invalid state barrier")
-            self.binding = binding
-            self.attempted = attempted
+            self.binding, self.attempted = capacity_state(self.state_path, self.realm)
             self.recovered = True
-        except (OSError, ValueError, KeyError, TypeError):
+        except (OSError, ValueError):
             print("ice-publisher: capacity history unavailable; known disabled", file=sys.stderr)
         today = datetime.date.today()
         self.stats = {"LAST_TOTAL": 0, "DAILY_BYTES": 0, "MONTHLY_BYTES": 0,
@@ -181,15 +184,21 @@ class Publisher:
             pass
 
     def capacity(self, body, now_ms):
+        # SAFETY: TimeoutError is an OSError subclass; the cycle deadline must end
+        # the cycle, never the history. A read OSError only blocks this cycle.
         try:
             if self.recovered:
                 try:
-                    saved = json.loads(self.state_path.read_text())
-                    if saved != {"version": 1, "binding": self.binding, "attemptedThroughMs": self.attempted}:
+                    binding, attempted = capacity_state(self.state_path, self.realm)
+                    if binding != self.binding or attempted < self.attempted:
                         raise ValueError("capacity history changed")
-                except (OSError, ValueError):
+                    self.attempted = attempted
+                except TimeoutError:
+                    raise
+                except ValueError as error:
                     self.recovered = False
                     self.blocked = True
+                    print(f"ice-publisher: capacity history unavailable: {type(error).__name__}: {error}", file=sys.stderr)
             snapshot = capacity_snapshot(body, self.realm, self.environment, now_ms)
             config = (self.environment.get("TOTAL_QUOTA"), "ADMISSION_LIMIT" in self.environment,
                       self.environment.get("ADMISSION_LIMIT"))
@@ -206,6 +215,8 @@ class Publisher:
                 self.blocked = False
             elif config != self.config:
                 self.blocked = True
+        except TimeoutError:
+            raise
         except (ValueError, OSError):
             self.blocked = True
         if not self.blocked:

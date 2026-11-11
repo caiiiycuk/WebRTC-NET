@@ -82,7 +82,8 @@ net.core.netdev_max_backlog = 8192
 
 # ── Conntrack ─────────────────────────────────────────────────────
 # Each TURN allocation creates conntrack entries. Default 65536 is
-# too low for heavy relay usage.
+# too low for heavy relay usage. Each entry costs about 256 bytes;
+# on a VM with less than 1 GB of RAM use 65536 instead.
 net.netfilter.nf_conntrack_max = 262144
 
 # ── Ephemeral port range ──────────────────────────────────────────
@@ -100,8 +101,17 @@ net.ipv4.tcp_fin_timeout = 15
 fs.file-max = 1048576
 EOF
 
+# The nf_conntrack module is loaded after systemd-sysctl on a fresh host,
+# so the nf_conntrack_max key above is silently skipped unless the module
+# is loaded first. Load it now and on every boot.
+echo nf_conntrack > /etc/modules-load.d/nf_conntrack.conf
+modprobe nf_conntrack
+
 sysctl --system
+sysctl net.netfilter.nf_conntrack_max net.netfilter.nf_conntrack_count
 ```
+
+If `nf_conntrack_max` prints the kernel default instead of the configured value, the module was not loaded when `sysctl --system` ran; load it and run `sysctl --system` again.
 
 ### Raise file descriptor limits
 
@@ -134,6 +144,7 @@ systemctl restart docker
 
 ```bash
 sysctl net.core.rmem_max net.core.wmem_max net.core.netdev_max_backlog
+sysctl net.netfilter.nf_conntrack_max net.netfilter.nf_conntrack_count
 ulimit -n
 ```
 
@@ -267,9 +278,11 @@ Source seconds become `observedAtMs` by multiplying by 1000. Missing, duplicate,
 
 Before sending a new known watermark, the publisher atomically replaces and fsyncs `/var/lib/coturn/capacity_state.json` and its directory. It freezes the first tuple at that watermark. Repeats require a healthy source and unchanged admission configuration. Failures block that watermark until a strictly newer healthy source snapshot. Restart loses the frozen tuple and therefore starts with `unknown` at the durable attempted watermark. The state file is private and contains binding and attempted watermark, not the TURN secret. One publisher per state volume is enforced with a process lock.
 
+The 5 second cycle deadline never disables the history. A deadline that fires while the history file is read or written ends only that cycle with `ice-publisher: cycle failed: TimeoutError: cycle deadline`; the next cycle reads the same file again. Every cycle re-reads the file and accepts its barrier only forward: the same binding with a strictly larger `attemptedThroughMs` becomes the new barrier (this is how a write interrupted by the deadline is picked up), and capacity stays `unknown` until a strictly newer healthy snapshot. A smaller barrier, a different binding, or invalid content disables `known` until the process restarts and logs `ice-publisher: capacity history unavailable: <ExceptionClass>: <reason>` once, without the file contents. A transient read error blocks only that cycle: capacity is published as `unknown` at the remembered barrier, nothing is logged, and the next successful read continues normally. Writing a larger barrier into the file from outside is tolerated but not recommended: it only delays `known` until a newer snapshot.
+
 Capacity history belongs to `DOMAIN`, not to the publish URL. The `publishUrl` saved in the state file is history metadata recorded at initialization; publications always go to the current `PUBLISH_URL`. Changing `PUBLISH_URL` for the same `DOMAIN` keeps the existing history and its attempted barrier: do not edit the state file and do not reinitialize it. The barrier is not reset by a URL change, so after a restart capacity stays `unknown` until a strictly newer healthy snapshot, exactly as without the change. Publisher versions before this one required the saved URL to match the current one; rolling back to such a version after a URL change disables capacity again until the fixed version is restored. Do not reset or restore an old state file to work around that.
 
-An existing file is required for known publication. Missing, corrupt, other-domain, or externally changed history fails closed, while legacy traffic and ICE publication can continue without capacity. Do not delete or reset state to recover an existing identity. Restore its durable attempted barrier after excluding all older publisher processes and all still-applicable POST requests. Reading Cloud's current watermark alone is insufficient because a pending POST may be newer. If this evidence is unavailable, leave capacity disabled. Rotating a secret does not reset history.
+An existing file is required for known publication. Missing, corrupt, or other-domain history, and a file whose barrier moved backward or whose binding changed, fail closed, while legacy traffic and ICE publication can continue without capacity. Do not delete or reset state to recover an existing identity. Restore its durable attempted barrier after excluding all older publisher processes and all still-applicable POST requests. Reading Cloud's current watermark alone is insufficient because a pending POST may be newer. If this evidence is unavailable, leave capacity disabled. Rotating a secret does not reset history.
 
 Only for a genuinely new identity with no previous capacity attempts, initialize the state once while its publisher is stopped:
 
