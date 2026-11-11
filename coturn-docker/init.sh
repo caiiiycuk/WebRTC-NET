@@ -157,7 +157,11 @@ echo "  View logs:      docker compose logs -f coturn"
 echo ""
 if [ -n "$STAGING" ]; then
 echo "  *** STAGING certificates — not browser-trusted ***"
-echo "  Re-run without --staging for production certs:"
-echo "    rm -f .env && docker compose down -v && ./init.sh"
+echo "  To switch to production certs, keep .env and the volumes and run:"
+echo "    docker compose run --rm --no-deps --entrypoint \"\" certbot \\"
+echo "      certbot certonly --webroot -w /var/www/certbot --force-renewal \\"
+echo "      --email \"$EMAIL\" --agree-tos --no-eff-email -d \"$DOMAIN\""
+echo "    docker compose restart nginx coturn"
+echo "  (README: Switch from staging to production certificates)"
 echo ""
 fi

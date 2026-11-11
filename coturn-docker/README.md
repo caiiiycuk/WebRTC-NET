@@ -193,7 +193,7 @@ The script will:
 6. Obtain a Let's Encrypt TLS certificate (port 80 must be reachable)
 7. Start all services
 
-> **Let's Encrypt rate limits:** Production certificates are limited to 5 duplicate certs per domain per week and 50 certs per registered domain per week. Always use `--staging` first to make sure everything works, then re-run without it. To switch from staging to production: `rm .env && docker compose down -v && ./init.sh`
+> **Let's Encrypt rate limits:** Production certificates are limited to 5 duplicate certs per domain per week and 50 certs per registered domain per week. Always use `--staging` first to make sure everything works, then switch as described in step 5 below. Never delete `.env` or the volumes for that switch: they hold the server identity and the capacity history.
 
 ### 4. Verify it's running
 
@@ -203,6 +203,20 @@ docker compose logs coturn --tail 50
 ```
 
 Visit `https://your-domain:8000/` in a browser to open the latency test page.
+
+### 5. Switch from staging to production certificates
+
+Keep `.env` and all volumes: the switch only replaces the certificate lineage. nginx keeps port 80, so request the production certificate through its ACME webroot instead of certbot's standalone listener (port 80 is taken, standalone would fail):
+
+```bash
+docker compose run --rm --no-deps --entrypoint "" certbot \
+  certbot certonly --webroot -w /var/www/certbot --force-renewal \
+  --email "$(sed -n 's/^EMAIL=//p' .env)" --agree-tos --no-eff-email \
+  -d "$(sed -n 's/^DOMAIN=//p' .env)"
+docker compose restart nginx coturn
+```
+
+Without `--staging` certbot talks to the production ACME server; `--force-renewal` replaces the staging certificate of the same domain in place, so `/etc/letsencrypt/live/<domain>/` keeps its path and the certbot renewal service keeps working. Only nginx and coturn, the certificate consumers, are restarted. `TURN_SECRET`, the publisher state in `coturn-data` and the capacity history are untouched. Do not use `docker compose down -v`, do not delete `.env` and do not run `--initialize-new-identity` for this: that destroys the capacity history and the server identity.
 
 ## Manual setup (without init.sh)
 
@@ -272,7 +286,7 @@ The `traffic` object reports total bytes relayed by coturn (received + sent), tr
 
 ### Capacity publication and recovery
 
-The same local scrape reads `turn_quota_used{realm=DOMAIN}`, `turn_quota_limit{realm=DOMAIN,scope="total"}`, and the global `turn_observability_snapshot_timestamp_seconds`. The configured template binds metrics to `127.0.0.1`, not all host interfaces. The scrape has a 1 second total timeout and a 2 MiB body limit, including legacy families. The producer documents at most 1 MiB for the new observability families; legacy families share the remaining budget. A larger response disables capacity rather than truncating or inventing samples. Check this limit against each deployment's complete metrics response.
+The same local scrape reads `turn_quota_used{realm=DOMAIN}`, `turn_quota_limit{realm=DOMAIN,scope="total"}`, and the global `turn_observability_snapshot_timestamp_seconds`. The shipped template binds metrics to `0.0.0.0:9641` so an external Prometheus can scrape them; the publisher always uses the loopback address (see Monitoring → Metrics for the exposure and firewall notes). The scrape has a 1 second total timeout and a 2 MiB body limit, including legacy families. The producer documents at most 1 MiB for the new observability families; legacy families share the remaining budget. A larger response disables capacity rather than truncating or inventing samples. Check this limit against each deployment's complete metrics response.
 
 Source seconds become `observedAtMs` by multiplying by 1000. Missing, duplicate, malformed, unready, regressing, more than 5 seconds old, or more than 2 seconds future samples disable capacity. Source total quota must equal the container's effective TOTAL_QUOTA. Empty or unset TOTAL_QUOTA retains the entrypoint fallback of 600; `.env.example` explicitly sets 9000. Unless ADMISSION_LIMIT is set, positive quotas use exact floor(TOTAL_QUOTA * 9 / 10). Empty or invalid explicit overrides never fall back. Unlimited quota requires a finite positive override. The 10% reserve is an operational choice, not a measured safe capacity.
 
@@ -591,7 +605,7 @@ docker compose up -d --force-recreate coturn
 - **HSTS**: Strict-Transport-Security header is set on the HTTPS ping endpoint
 - **No CLI**: The coturn admin CLI is disabled
 - **Session limits**: `USER_QUOTA` concurrent allocations per user (default 128), `TOTAL_QUOTA` in total (default 9000)
-- **Metrics**: The coturn Prometheus endpoint listens only on `127.0.0.1:9641`
+- **Metrics**: The coturn Prometheus endpoint (`0.0.0.0:9641`, plain HTTP, no authentication) is bound to all host interfaces for external scraping; restrict port 9641 to monitoring hosts in the firewall or set `prometheus-address=127.0.0.1` (see Monitoring → Metrics)
 
 ### Additional recommendations
 
@@ -628,12 +642,45 @@ coturn-nginx      running (healthy)       0.0.0.0:80->80/tcp, 0.0.0.0:8000->8000
 coturn-certbot    running
 ```
 
-### Live session count
+### Metrics
 
-Coturn exports the number of active TURN allocations as a metric on the host:
+coturn serves Prometheus metrics over plain HTTP on TCP port 9641. The shipped `turnserver.conf.template` binds the endpoint to `0.0.0.0`, that is every IPv4 interface of the host (coturn runs with `network_mode: host`), so an external Prometheus can scrape `http://<server-ip>:9641/metrics`. The publisher keeps reading the same endpoint through `http://127.0.0.1:9641/metrics`.
+
+> **Exposure.** The endpoint has no authentication and no TLS: whoever can reach port 9641 reads allocation counts, quota usage and traffic totals. Changing the template does not touch any firewall, so the port stays closed until you open it. Open it only for the monitoring hosts, never for any source:
+>
+> ```bash
+> ufw allow from 203.0.113.10 to any port 9641 proto tcp     # one Prometheus host
+> ufw allow from 203.0.113.0/24 to any port 9641 proto tcp   # or a monitoring subnet
+> ```
+>
+> Add the same source-restricted rule to your provider's cloud firewall if you use one.
+
+Local scrape on the host (what the publisher uses; `turn_quota_used` is the number of active allocations):
 
 ```bash
 curl -s http://127.0.0.1:9641/metrics | grep '^turn_quota_used'
+```
+
+Remote scrape from an allowed monitoring host:
+
+```bash
+curl -s http://turn.example.com:9641/metrics | grep -E '^turn_(quota_used|total_traffic_rcvb|total_traffic_sentb)'
+```
+
+Prometheus job:
+
+```yaml
+scrape_configs:
+  - job_name: coturn
+    static_configs:
+      - targets: ["turn.example.com:9641"]
+```
+
+To keep the endpoint local only, set the address back to loopback in the template and recreate coturn. The publisher and the local commands keep working; remote connections are refused at the socket:
+
+```bash
+sed -i 's/^prometheus-address=.*/prometheus-address=127.0.0.1/' turnserver.conf.template
+docker compose up -d --force-recreate coturn
 ```
 
 ### Bandwidth monitoring
@@ -661,21 +708,52 @@ docker compose exec coturn turnutils_stunclient your-domain
 
 ### Testing TURN from the command line
 
-Generate ephemeral credentials, then test:
+A TURN check must relay payload end to end: a STUN binding, a successful allocation or a TLS handshake alone only proves that a port answers. Run the checks from a **separate machine**, not from the TURN host, with the tester from the image this deployment pins (`FROM` in `Dockerfile`). Distribution packages of `turnutils_uclient` are often older and incompatible, see "Older testers" below.
+
+On the TURN host, mint temporary credentials without printing the shared secret:
 
 ```bash
-# Generate credentials (valid for 24h)
-SECRET=$(grep TURN_SECRET .env | cut -d= -f2)
-TIMESTAMP=$(($(date +%s) + 86400))
-USERNAME="$TIMESTAMP:cli-test-$(date +%s)"
-CREDENTIAL=$(echo -n "$USERNAME" | openssl dgst -sha1 -hmac "$SECRET" -binary | base64)
-
-echo "Username: $USERNAME"
-echo "Credential: $CREDENTIAL"
-
-# Test TURN allocation
-docker compose exec coturn turnutils_uclient -u "$USERNAME" -w "$CREDENTIAL" your-domain
+# On the TURN host. The credentials expire after 1 hour; the secret stays in .env.
+SECRET=$(sed -n 's/^TURN_SECRET=//p' .env)
+USERNAME="$(( $(date +%s) + 3600 )):relay-check"
+CREDENTIAL=$(printf %s "$USERNAME" | openssl dgst -sha1 -hmac "$SECRET" -binary | base64)
+unset SECRET
+printf 'USERNAME=%s\nCREDENTIAL=%s\n' "$USERNAME" "$CREDENTIAL" > relay-check.env
+chmod 600 relay-check.env
 ```
+
+Copy `relay-check.env` to the test machine over a trusted channel (`scp`); never copy `.env` or the secret. The tester receives the credentials as command-line arguments, which other local users of the test machine can read with `ps`, so use a machine you trust and delete the file when done.
+
+On the test machine (Docker required):
+
+```bash
+TURN_HOST=turn.example.com
+IMAGE=ghcr.io/caiiiycuk/coturn:4.18.0-4   # the tag from FROM in Dockerfile
+set -a; . ./relay-check.env; set +a
+
+# UDP relay: two paired clients exchange 200 payload messages each through the relay
+timeout 120 docker run --rm --network host --entrypoint turnutils_uclient "$IMAGE" -y -n 200 -l 100 \
+  -u "$USERNAME" -w "$CREDENTIAL" -p 3478 "$TURN_HOST"
+
+# TLS relay (TURNS): the same exchange over TLS at the default 20 ms send interval
+timeout 120 docker run --rm --network host --entrypoint turnutils_uclient "$IMAGE" -t -S -y -n 200 -l 100 \
+  -u "$USERNAME" -w "$CREDENTIAL" -p 5349 "$TURN_HOST"
+```
+
+`--entrypoint turnutils_uclient` is required: the image's default entrypoint passes every argument through `echo`, which swallows `-n` and silently runs the default 5 messages per client.
+
+Each check passes only if all of the following hold in the summary printed at the end:
+
+- `tot_send_msgs` and `tot_recv_msgs` are equal and greater than zero;
+- `Total lost packets 0 (0.000000%)`;
+- the command finished on its own, not by `timeout`.
+
+Anything else is a failure, even when the allocation succeeded. `tot_recv_msgs` below `tot_send_msgs` means payload was lost between the two clients; do not lower `-n` or raise the interval to make the numbers match.
+
+**Older testers.** Two unrelated failures look similar, and neither means the server is broken:
+
+- `Bad channel number` right after the allocation from a distribution package (for example Ubuntu's coturn 4.6.1): an incompatible old client. Use the pinned image.
+- On TLS only, with UDP clean, `tot_recv_msgs` below `tot_send_msgs` from image `4.18.0-3` or older: that tester counted several TLS frames returned by one read as one message. Image `4.18.0-4` and newer contain the fixed `turnutils_uclient`; use the pinned image. If you must run an older image, add `-z 1000` (one message per second) to the TLS command as a temporary workaround: the slower pace hides the counting bug, so it verifies the server's relay, not the tester, and it must not be used to measure capacity.
 
 ## Log management
 
@@ -700,30 +778,46 @@ docker compose up -d --force-recreate coturn
 
 ## Backup and restore
 
-Only two things need backing up:
+Three things carry state: `.env` (secret, domain, publish settings), the `certbot-certs` volume (certificates) and the `coturn-data` volume (publisher state: `capacity_state.json` with the identity and the capacity barrier, `traffic_stats`, `publisher.lock`). Back up all three together. The `coturn-data` volume is what lets a restored server keep its capacity history instead of starting as a new identity.
 
+Volume names depend on the Compose project name (the directory name by default, or `COMPOSE_PROJECT_NAME`), so the commands below resolve it instead of assuming `coturn-docker_*`.
 
-| What             | Where                         | Command               |
-| ---------------- | ----------------------------- | --------------------- |
-| Configuration    | `.env`                        | `cp .env .env.backup` |
-| TLS certificates | Docker volume `certbot-certs` | See below             |
+### Back up
 
-
-### Back up certificates
+Stop coturn first so the publisher is not writing while the volume is copied; nginx and certbot keep running.
 
 ```bash
-docker run --rm -v coturn-docker_certbot-certs:/certs -v $(pwd):/backup \
-  alpine tar czf /backup/certs-backup.tar.gz -C /certs .
+PROJECT=$(docker compose config --format json | python3 -c 'import json, sys; print(json.load(sys.stdin)["name"])')
+docker compose stop coturn
+cp .env .env.backup && chmod 600 .env.backup
+docker run --rm -v "${PROJECT}_certbot-certs:/certs:ro" -v "$PWD:/backup" alpine \
+  tar czf /backup/certs-backup.tar.gz -C /certs .
+docker run --rm -v "${PROJECT}_coturn-data:/data:ro" -v "$PWD:/backup" alpine \
+  tar czf /backup/coturn-data-backup.tar.gz -C /data .
+docker compose start coturn
 ```
 
-### Restore certificates
+`.env.backup` contains `TURN_SECRET`; keep it and both archives private.
+
+### Restore
+
+Restore into the project you actually run, before coturn starts, so the publisher reads the restored history on its first start:
 
 ```bash
-docker run --rm -v coturn-docker_certbot-certs:/certs -v $(pwd):/backup \
-  alpine sh -c "cd /certs && tar xzf /backup/certs-backup.tar.gz"
+PROJECT=$(docker compose config --format json | python3 -c 'import json, sys; print(json.load(sys.stdin)["name"])')
+cp .env.backup .env && chmod 600 .env
+docker compose stop coturn
+docker compose create coturn
+docker run --rm -v "${PROJECT}_certbot-certs:/certs" -v "$PWD:/backup:ro" alpine \
+  sh -c 'cd /certs && tar xzf /backup/certs-backup.tar.gz'
+docker run --rm -v "${PROJECT}_coturn-data:/data" -v "$PWD:/backup:ro" alpine \
+  sh -c 'cd /data && tar xzf /backup/coturn-data-backup.tar.gz'
+docker compose up -d
 ```
 
-If you lose the certificates, simply re-run `./init.sh` — certbot will issue new ones.
+`docker compose create` creates the volumes and the container without starting them; `tar` preserves ownership and the private `0600` mode of the state files. After the start, `docker compose logs coturn | grep ice-publisher` must not show `capacity history unavailable`; capacity starts as `unknown` with the restored barrier until a newer snapshot, as after any restart. Do not merge state files by hand and do not run `--initialize-new-identity` for a restored server: a missing or invalid `capacity_state.json` after a restore means the backup is incomplete, not that the server is a new identity (see "Capacity publication and recovery").
+
+If only the certificates are lost, re-run `./init.sh`: certbot issues new ones while `.env` and `coturn-data` stay in place.
 
 ## Updating
 
@@ -790,8 +884,13 @@ docker compose logs -f
 
 - Verify certificates exist: `docker compose exec coturn ls /etc/letsencrypt/live/your-domain/`
 - Check coturn logs: `docker compose logs coturn`
-- Ensure ports 5349 and 443 are open
+- Ensure port 5349/tcp is open: TURNS uses 5349, not 443 (`8000/tcp` is only the HTTPS ping page, and 443 is used only if you proxy ACME through a host nginx)
 - Test with: `openssl s_client -connect your-domain:5349`
+
+**Prometheus cannot scrape port 9641**
+
+- `ss -ltnp | grep 9641` on the host must show `0.0.0.0:9641`; `127.0.0.1:9641` means the template was switched to loopback only, and remote scrapes are refused by design
+- Allow the monitoring host's address on port 9641 in `ufw` and in the provider firewall (see Monitoring → Metrics); the default template change opens no firewall port by itself
 
 **No relay candidates in browser**
 

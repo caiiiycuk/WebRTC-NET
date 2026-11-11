@@ -42,8 +42,11 @@ denied-peer-ip=203.0.113.0-203.0.113.255
 denied-peer-ip=240.0.0.0-255.255.255.255
 
 # ── Metrics ───────────────────────────────────────────────────────
+# Plain HTTP without authentication on TCP 9641 of every host IPv4 interface
+# (network_mode: host); restrict the port to monitoring hosts in the firewall.
+# Set prometheus-address=127.0.0.1 to keep the endpoint local only.
 prometheus
-prometheus-address=127.0.0.1
+prometheus-address=0.0.0.0
 
 # ── Logging ───────────────────────────────────────────────────────
 log-file=stdout
