@@ -100,6 +100,14 @@ if(HUMBLENET_NATIVE)
 	endif()
 
 	if(USE_BORINGSSL)
+		# glibc >= 2.42 makes memchr()/strchr() const-correct through _Generic, so
+		# OPENSSL_memchr() in this BoringSSL pin returns const void * as void *,
+		# which clang >= 21 rejects under BoringSSL's -Werror. The flag must share
+		# the CMAKE_C_FLAGS cache entry with the arch flags: the initial cache
+		# forces that entry and would discard a separate -D.
+		set(BORINGSSL_ARCH_CONFIG ${LINUX_ARCH_CONFIG})
+		list(TRANSFORM BORINGSSL_ARCH_CONFIG APPEND " -Wno-incompatible-pointer-types-discards-qualifiers"
+			REGEX "^-DCMAKE_C_FLAGS:STRING=")
 		find_program(GO_EXECUTABLE go)
 		if(WIN32)
 			find_program(CMAKE_ASM_NASM_COMPILER
@@ -122,7 +130,7 @@ if(HUMBLENET_NATIVE)
 				-DOPENSSL_NO_ASM:BOOL=ON
 				-DBUILD_TESTS:BOOL=OFF
 				-DBUILD_TOOLS:BOOL=OFF
-				${LINUX_ARCH_CONFIG}
+				${BORINGSSL_ARCH_CONFIG}
 		)
 
 		ExternalProject_Get_Property(BoringSSL-build INSTALL_DIR BINARY_DIR)
