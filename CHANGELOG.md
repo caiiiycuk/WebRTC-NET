@@ -1,7 +1,29 @@
 # Changelog
 
-Generated from repository tags. `v1.1.2` is the current `HEAD` version.
+Generated from repository tags. `v1.1.3` is the current `HEAD` version.
 Merge commits are omitted when they only duplicate the commits they merge.
+
+## v1.1.3 - 2026-11-12
+
+- ef40c7a build: keep BoringSSL compiling with clang 21 and glibc 2.42
+- 29efc66 openspec: archive fix-dzcoturn-probes-and-metrics
+- 8e131fa coturn-docker: fix TLS tester framing, expose metrics, document relay checks and safe maintenance
+- 7605d49 openspec: propose fix-dzcoturn-probes-and-metrics
+- 7b11fb7 openspec: archive harden-capacity-history-against-deadline
+- 7e30f13 coturn-docker: keep capacity history across cycle deadlines
+- bd1cbfe openspec: propose harden-capacity-history-against-deadline
+- 53b4d42 coturn-docker: add dzcoturn.9 migration notes, fix publish URL in dzcoturn.8 notes
+- 1859b85 openspec: archive decouple-capacity-from-publish-url
+- bbec3e1 coturn-docker: keep capacity history when PUBLISH_URL changes
+- 9ced1aa openspec: archive restart-coturn-publisher
+- 0fa7aff coturn-docker: restart publisher from entrypoint and survive deadline outside cycle
+- 532c925 openspec: propose decouple-capacity-from-publish-url and restart-coturn-publisher
+- 13b42f9 coturn-docker: advertise STUN only when turnserver.conf supports anonymous UDP Binding
+- 222530f coturn-docker: publish TURN capacity via publisher.py on release/4.18.0-3
+- 38c8b52 coturn: bump to release/4.18.0-2 with capacity metrics
+- c0079af openspec: archive switch-coturn-to-fork
+- 761c927 coturn-docker: build on ghcr.io/caiiiycuk/coturn:4.18.0-1
+- 141b2e2 Initialize OpenSpec with OpenCode integration
 
 ## v1.1.2 - 2026-10-02
 
