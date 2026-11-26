@@ -1,3 +1,4 @@
+#include "humblenet_portal_internal.h"
 #include "humblenet_p2p_internal.h"
 #include "humblenet_alias.h"
 
@@ -480,6 +481,7 @@ static ha_bool p2pSignalProcess(const humblenet::HumblePeer::Message *msg, void 
 	using namespace humblenet;
 
 	auto msgType = msg->message_type();
+    if (portal_enabled()) portal_notify(nullptr);
 
 	switch (msgType) {
 		case HumblePeer::MessageType::P2POffer:
@@ -499,22 +501,32 @@ static ha_bool p2pSignalProcess(const humblenet::HumblePeer::Message *msg, void 
 				// webrtc connections not supported
 				assert(humbleNetState.p2pConn);
 				sendPeerRefused(humbleNetState.p2pConn.get(), peer);
+                if (portal_enabled()) break;
 			}
 
-			Connection *connection = new Connection(Incoming);
+			Connection *connection = portal_enabled() ? portal_offer(peer) : new Connection(Incoming);
+            if (!connection) { sendPeerRefused(humbleNetState.p2pConn.get(), peer); break; }
 			connection->status = HUMBLENET_CONNECTION_CONNECTING;
 			connection->otherPeer = peer;
 			{
 				HUMBLENET_UNGUARD();
 				connection->socket = internal_create_webrtc(humbleNetState.context);
 			}
+            if (!connection->socket) {
+                if (portal_owns(connection)) portal_bound(connection);
+                humblenet_connection_close(connection); break;
+            }
 			internal_set_data( connection->socket, connection );
+            if (portal_owns(connection)) {
+                portal_bound(connection);
+                if (connection->status == HUMBLENET_CONNECTION_CLOSED) break;
+            }
 
 			humbleNetState.pendingPeerConnectionsIn.insert(std::make_pair(peer, connection));
 
 			auto offer = p2p->offer();
 
-			LOG("P2PConnect SDP got %u's offer = \"%s\"\n", peer, offer->c_str());
+			LOG("RTC negotiation received from peer %u\n", peer);
 			int ret;
 			{
 				HUMBLENET_UNGUARD();
@@ -550,7 +562,7 @@ static ha_bool p2pSignalProcess(const humblenet::HumblePeer::Message *msg, void 
 
 			auto offer = p2p->offer();
 
-			LOG("P2PResponse SDP got %u's response offer = \"%s\"\n", peer, offer->c_str());
+			LOG("RTC negotiation received from peer %u\n", peer);
 			int ret;
 			{
 				HUMBLENET_UNGUARD();
@@ -609,7 +621,7 @@ static ha_bool p2pSignalProcess(const humblenet::HumblePeer::Message *msg, void 
 
 			if( it->second->socket && it->second->status == HUMBLENET_CONNECTION_CONNECTING ) {
 				auto offer = iceCandidate->offer();
-				LOG("Got ice candidate from peer: %d, %s\n", it->second->otherPeer, offer->c_str() );
+				LOG("RTC candidate received from peer %u\n", it->second->otherPeer);
 
 				{
 					HUMBLENET_UNGUARD();

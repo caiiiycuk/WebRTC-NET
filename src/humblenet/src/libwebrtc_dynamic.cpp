@@ -1,6 +1,7 @@
 #if !defined(EMSCRIPTEN) && defined(HUMBLENET_LOAD_WEBRTC)
 
 #include "libwebrtc.h"
+#include "humblenet_p2p.h"
 
 #include <cstdlib>
 #include <string>
@@ -204,20 +205,21 @@ static bool webrtc_AllowMicrostackFallback()
 static void webrtc_LoadLibrary()
 {
 #ifdef LOAD_WEBRTC_SO
-	dllHandle = LoadObject(WEBRTC_LIBRARY);
 #ifdef __linux__
-	if (!dllHandle) {
-		Dl_info dl_info;
-		if (dladdr((const void*)"", &dl_info) != 0)  {
-			std::string buff(dl_info.dli_fname);
-			auto pos = buff.find_last_of('/');
-			if (pos != buff.npos) {
-				buff.erase(pos);
-				buff += "/" WEBRTC_LIBRARY;
-				dllHandle = LoadObject(buff.c_str());
-			}
-		}
-	}
+ // Resolve only the backend beside this provider, never an unrelated loader-search result.
+ Dl_info info;
+ std::string path;
+ if (dladdr((const void*)&webrtc_LoadLibrary, &info) && info.dli_fname) {
+  path = info.dli_fname;
+  auto slash = path.find_last_of('/');
+  if (slash != path.npos) {
+   path.erase(slash);
+   path += "/" WEBRTC_LIBRARY;
+   dllHandle = LoadObject(path.c_str());
+  }
+ }
+#else
+ dllHandle = LoadObject(WEBRTC_LIBRARY);
 #endif
 #ifdef __APPLE__
 	// Special case for OS X. look for a bundle
@@ -266,6 +268,26 @@ static void webrtc_LoadLibrary()
 	#else
 			fn_table = fn_microstack;
 	#endif
+}
+
+extern "C" HUMBLENET_API const char* HUMBLENET_CALL humblenet_dz_backend_path(void) {
+#ifdef LOAD_WEBRTC_SO
+ Dl_info info;
+ if (dllHandle && dladdr((const void*)fn_table.libwebrtc_create_context, &info)) return info.dli_fname;
+#endif
+ return nullptr;
+}
+
+const struct lwrtc_portal_api *libwebrtc_portal_api() {
+#ifdef LOAD_WEBRTC_SO
+    if (!dllHandle) webrtc_LoadLibrary();
+    if (!dllHandle) return nullptr;
+    typedef const lwrtc_portal_api *(*Query)();
+    auto query = reinterpret_cast<Query>(dlsym(dllHandle, "libwebrtc_portal_api"));
+    return query ? query() : nullptr;
+#else
+    return nullptr;
+#endif
 }
 
 #endif

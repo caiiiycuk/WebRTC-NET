@@ -1,12 +1,15 @@
 #ifndef HUMBLENET_P2P_H
 #define HUMBLENET_P2P_H
 
+#ifdef __cplusplus
 #include <functional>
 #include <string>
 #include <tuple>
 #include <vector>
+#endif
 
 #include "humblenet.h"
+#include "humblenet_portal.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -29,6 +32,17 @@ HUMBLENET_API ha_bool HUMBLENET_CALL humblenet_p2p_supported();
 /*
 * Initialize the peer-to-peer library.
 */
+/* Native DosZone observation ABI; no browser generation narrowing. */
+HUMBLENET_API int HUMBLENET_CALL humblenet_dz_signaling_state(uint64_t* generation);
+HUMBLENET_API int HUMBLENET_CALL humblenet_dz_alias_state(const char* alias, PeerId* peer, uint64_t* generation);
+HUMBLENET_API PeerId HUMBLENET_CALL humblenet_dz_route_for_peer(PeerId peer);
+HUMBLENET_API const char* HUMBLENET_CALL humblenet_dz_backend_path(void);
+/* Native Connection lifetime; state0 absent/closed,1 connecting,2 connected. */
+HUMBLENET_API int HUMBLENET_CALL humblenet_dz_connection_state(PeerId peer, uint64_t* lifetime);
+HUMBLENET_API int HUMBLENET_CALL humblenet_dz_recvfrom(void* buffer, uint32_t length, PeerId* peer, uint8_t channel, uint64_t* lifetime);
+HUMBLENET_API ha_bool HUMBLENET_CALL humblenet_dz_disconnect(PeerId peer, uint64_t lifetime);
+
+
 HUMBLENET_API ha_bool HUMBLENET_CALL humblenet_p2p_init(const char* server, const char* client_token, const char* client_secret, const char* auth_token);
 
 /*
@@ -58,7 +72,9 @@ HUMBLENET_API ha_bool HUMBLENET_CALL humblenet_p2p_unregister_alias(const char* 
 HUMBLENET_API PeerId HUMBLENET_CALL humblenet_p2p_virtual_peer_for_alias(const char* name);
 
 
+#ifdef __cplusplus
 HUMBLENET_API ha_bool HUMBLENET_CALL humblenet_p2p_alias_query(const char* query, const std::function<void(std::vector<std::pair<std::string,PeerId>>)>& callback);
+#endif
 
 /*
 * Send a message to a peer.

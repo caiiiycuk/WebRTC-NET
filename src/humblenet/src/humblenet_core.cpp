@@ -1,3 +1,4 @@
+#include "humblenet_portal_internal.h"
 #include "humblenet.h"
 #include "humblenet_p2p.h"
 #include "humblenet_p2p_internal.h"
@@ -89,13 +90,13 @@ bool append_ice_server(const std::string& url,
 		return true;
 	}
 
-	if(url.rfind("turn:", 0) == 0 || url.rfind("turns:", 0) == 0 || !username.empty() || !credential.empty()) {
+	if(url.rfind("turn:", 0) == 0 || url.rfind("turns:", 0) == 0) {
 		servers.emplace_back(url, username, credential);
 		return true;
 	}
 
-	servers.emplace_back(url);
-	return true;
+	error = "ICE URL must use stun:, stuns:, turn: or turns:";
+	return false;
 }
 
 bool parse_ice_servers_json(const char* json,
@@ -174,21 +175,9 @@ bool has_turn_server(const std::vector<humblenet::ICEServer>& servers) {
 	});
 }
 
-void abort_invalid_ice_configuration(const std::string& reason) {
-	std::fprintf(stderr,
-		"\n"
-		"########################################################################\n"
-		"# HUMBLENET FATAL: INVALID ICE SERVER CONFIGURATION                    #\n"
-		"########################################################################\n"
-		"%s\n"
-		"HumbleNet requires at least one STUN or TURN server before P2P startup.\n"
-		"Native: call humblenet_set_iceservers() before humblenet_p2p_init().\n"
-		"Web: call that API or define window.netConfig.iceServers before startup.\n"
-		"Execution is being terminated.\n"
-		"########################################################################\n\n",
-		reason.c_str());
-	std::fflush(stderr);
-	std::abort();
+bool reject_invalid_ice_configuration(const std::string& reason) {
+ humblenet_set_error(reason.c_str());
+ return false;
 }
 
 void print_missing_turn_server_warning() {
@@ -210,23 +199,24 @@ void warn_if_turn_server_is_missing(const std::vector<humblenet::ICEServer>& ser
 	}
 }
 
-void validate_ice_configuration(const std::vector<humblenet::ICEServer>& servers) {
+bool validate_ice_configuration(const std::vector<humblenet::ICEServer>& servers) {
 	if(servers.empty()) {
-		abort_invalid_ice_configuration("The final ICE server list is empty.");
+		return reject_invalid_ice_configuration("The final ICE server list is empty.");
 	}
 
 	warn_if_turn_server_is_missing(servers);
+ return true;
 }
 
 #if defined(EMSCRIPTEN)
-void apply_net_config_ice_servers_fallback() {
+bool apply_net_config_ice_servers_fallback() {
 	if(humbleNetState.iceServersConfiguredExplicitly) {
-		return;
+		return true;
 	}
 
 	char* json = humblenet_get_net_config_ice_servers_json();
 	if(json == nullptr) {
-		return;
+		return true;
 	}
 
 	std::vector<humblenet::ICEServer> parsedServers;
@@ -235,10 +225,11 @@ void apply_net_config_ice_servers_fallback() {
 	std::free(json);
 
 	if(!parsed) {
-		abort_invalid_ice_configuration("Unable to use window.netConfig.iceServers: " + error);
+		return reject_invalid_ice_configuration("Unable to use window.netConfig.iceServers: " + error);
 	}
 
 	humbleNetState.configuredIceServers.swap(parsedServers);
+    return true;
 }
 #endif
 
@@ -294,6 +285,7 @@ uint64_t sys_milliseconds (void)
 void signal();
 
 void blacklist_peer( PeerId peer ) {
+    if (portal_enabled()) return;
 	humbleNetState.peerBlacklist.insert( std::make_pair( peer, sys_milliseconds() + 1000 ) );
 }
 
@@ -303,6 +295,7 @@ void blacklist_peer( PeerId peer ) {
  * Side effect: will clear expired blacklist entries.
  */
 bool is_peer_blacklisted( PeerId peer_id ) {
+    if (portal_enabled()) return portal_blacklisted(peer_id);
 	auto it = humbleNetState.peerBlacklist.find(peer_id);
 	if( it == humbleNetState.peerBlacklist.end() )
 		return false;
@@ -351,6 +344,7 @@ bool can_try_peer( PeerId peer_id ) {
 // BEGIN CONNECTION HANDLING
 
 void humblenet_connection_set_closed( Connection* conn ) {
+    if (portal_owns(conn)) { portal_closed(conn); return; }
 	if( conn->socket ) {
 		// clear our state first so callbacks dont work on us.
 		humbleNetState.connections.erase(conn->socket);
@@ -470,6 +464,7 @@ Connection *humblenet_connect_websocket(const char *server_addr) {
 
 
 Connection *humblenet_connect_peer(PeerId peer_id) {
+    if (portal_enabled()) { humblenet_set_error("Portal never initiates peer connections"); return nullptr; }
 	if( ! can_try_peer( peer_id ) )
 		return NULL;
 
@@ -479,6 +474,7 @@ Connection *humblenet_connect_peer(PeerId peer_id) {
 		HUMBLENET_UNGUARD();
 		connection->socket = internal_create_webrtc(humbleNetState.context);
 	}
+    if (!connection->socket) { humblenet_connection_close(connection); return nullptr; }
 	internal_set_data(connection->socket, connection);
 
 	humbleNetState.pendingPeerConnectionsOut.emplace(peer_id, connection);
@@ -503,6 +499,7 @@ Connection *humblenet_connect_peer(PeerId peer_id) {
 
 
 void humblenet_connection_close(Connection *connection) {
+    if (portal_owns(connection)) { portal_closed(connection); return; }
 	assert(connection != NULL);
 
 	humblenet_connection_set_closed(connection);
@@ -538,12 +535,12 @@ int on_sdp( internal_socket_t* s, const char* offer, void* user_data ) {
 	int flags = 0x2;
 
 	if( conn->inOrOut == Incoming ) {
-		LOG("P2PConnect SDP sent %u response offer = \"%s\"\n", conn->otherPeer, offer);
+	LOG("RTC negotiation sent to peer %u\n", conn->otherPeer);
 		if( ! sendP2PResponse(humbleNetState.p2pConn.get(), conn->otherPeer, offer) ) {
 			return -1;
 		}
 	} else {
-		LOG("outgoing SDP sent %u offer: \"%s\"\n", conn->otherPeer, offer);
+	LOG("RTC negotiation sent to peer %u\n", conn->otherPeer);
 		if( ! sendP2PConnect(humbleNetState.p2pConn.get(), conn->otherPeer, flags, offer) ) {
 			return -1;
 		}
@@ -565,7 +562,7 @@ int on_ice_candidate( internal_socket_t* s, const char* offer, void* user_data )
 	// This is OK with trickle ICE
 	// assert( conn->status == HUMBLENET_CONNECTION_CONNECTING );
 
-	LOG("Sending ice candidate to peer: %u, %s\n", conn->otherPeer, offer );
+	LOG("RTC negotiation sent to peer %u\n", conn->otherPeer);
 	if( ! sendICECandidate(humbleNetState.p2pConn.get(), conn->otherPeer, offer) ) {
 		return -1;
 	}
@@ -634,6 +631,7 @@ int on_connect (internal_socket_t* s, void* user_data) {
 }
 
 int on_accept_channel( internal_socket_t* s, const char* name, void* user_data ) {
+    if (portal_enabled() && (!user_data || static_cast<Connection *>(user_data)->status == HUMBLENET_CONNECTION_CLOSED)) return -1;
 	HUMBLENET_GUARD();
 
 	assert( user_data );
@@ -642,13 +640,14 @@ int on_accept_channel( internal_socket_t* s, const char* name, void* user_data )
 
 	assert( conn->status == HUMBLENET_CONNECTION_CONNECTING );
 	conn->status = HUMBLENET_CONNECTION_CONNECTED;
+    if (portal_owns(conn)) { humbleNetState.connections[s] = conn; portal_opened(conn); }
 	// This connection is now fully established and must not be treated as pending.
 	// Otherwise signaling reconnect logic can incorrectly close active WebRTC channels.
 	erase_value(humbleNetState.pendingPeerConnectionsOut, conn);
 	erase_value(humbleNetState.pendingPeerConnectionsIn, conn);
 	erase_value(humbleNetState.pendingAliasConnectionsOut, conn);
 
-	LOG("accepted channel: %d:%s\n", conn->otherPeer, name );
+	LOG("accepted channel: %d:%s\n", conn->otherPeer, portal_owns(conn) ? "-" : name );
 
 	signal();
 
@@ -677,6 +676,7 @@ int on_connect_channel( internal_socket_t* s, const char* name, void* user_data 
 // called each time data is received.
 int on_data( internal_socket_t* s, const void* data, int len, void* user_data ) {
 	HUMBLENET_GUARD();
+    if (portal_owns(static_cast<Connection *>(user_data))) return portal_ingress(static_cast<Connection *>(user_data), data, len);
 
 	// already disconnected from this socket.
 	if( ! user_data )
@@ -742,6 +742,9 @@ int on_disconnect( internal_socket_t* s, void* user_data ) {
 
 int on_destroy( internal_socket_t* s, void* user_data ) {
 	HUMBLENET_GUARD();
+    if (portal_owns(static_cast<Connection *>(user_data))) {
+        humbleNetState.connections.erase(s); portal_destroyed(static_cast<Connection *>(user_data)); return 0;
+    }
 
 	// if no user_data attached, then nothing to cleanup.
 	if( ! user_data )
@@ -783,7 +786,7 @@ ha_bool HUMBLENET_CALL humblenet_set_iceservers(const char* json) {
 		return false;
 	}
 	if(parsedServers.empty()) {
-		abort_invalid_ice_configuration("humblenet_set_iceservers() received an empty ICE server list.");
+		return reject_invalid_ice_configuration("humblenet_set_iceservers() received an empty ICE server list.");
 	}
 	const bool turnServerMissing = !has_turn_server(parsedServers);
 
@@ -804,9 +807,9 @@ ha_bool HUMBLENET_CALL humblenet_set_iceservers(const char* json) {
 
 ha_bool internal_p2p_register_protocol() {
 #if defined(EMSCRIPTEN)
-	apply_net_config_ice_servers_fallback();
+	if (!apply_net_config_ice_servers_fallback()) return false;
 #endif
-	validate_ice_configuration(humbleNetState.configuredIceServers);
+	if (!validate_ice_configuration(humbleNetState.configuredIceServers)) return false;
 
 	internal_callbacks_t callbacks;
 
@@ -1001,6 +1004,7 @@ void humblenet_unlock() {
 }
 
 void signal() {
+    portal_notify(nullptr);
 	poll_interrupt();
 }
 
@@ -1030,3 +1034,12 @@ void humblenet_timer( timer_callback_t callback, int timeout, void* data)
 }
 
 #endif
+
+int humblenet_connection_portal_write(Connection *conn, const void *data, uint32_t length) {
+    if (!portal_owns(conn) || conn->status != HUMBLENET_CONNECTION_CONNECTED || !conn->socket) return -1;
+    auto *socket = conn->socket;
+    int result;
+    { HUMBLENET_UNGUARD(); result = internal_portal_write(socket, data, length); }
+    if (result < 0 && conn->status != HUMBLENET_CONNECTION_CLOSED) portal_closed(conn);
+    return result;
+}

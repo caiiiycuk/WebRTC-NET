@@ -84,7 +84,7 @@ HUMBLENET_API ha_bool HUMBLENET_CALL humblenet_init();
  * Web clients fall back to window.netConfig.iceServers when this API has not
  * been called before humblenet_p2p_init().
  * peer-server is used for signaling only and does not provide ICE settings.
- * An empty configuration is fatal. A configuration without TURN is accepted,
+ * An empty configuration is rejected. A configuration without TURN is accepted,
  * but HumbleNet prints a prominent warning because some peers will be unreachable.
  */
 HUMBLENET_API ha_bool HUMBLENET_CALL humblenet_set_iceservers(const char* json);

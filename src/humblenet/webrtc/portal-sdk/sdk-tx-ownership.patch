@@ -1,0 +1,728 @@
+--- a/net/dcsctp/public/tx_ownership.h
++++ b/net/dcsctp/public/tx_ownership.h
+@@ -0,0 +1,30 @@
++#ifndef NET_DCSCTP_PUBLIC_TX_OWNERSHIP_H_
++#define NET_DCSCTP_PUBLIC_TX_OWNERSHIP_H_
++#include <cstdint>
++#include <limits>
++namespace dcsctp {
++struct TxOwnership {
++  uint64_t payload_bytes = 0;
++  uint64_t records = 0;
++  uint64_t reservation_bytes = 0;
++  uint64_t reservation_records = 0;
++  bool valid = true;
++  void AddCounter(uint64_t& value, uint64_t add) {
++    if (add > std::numeric_limits<uint64_t>::max() - value) { valid = false; return; }
++    value += add;
++  }
++  void AddOwned(uint64_t bytes, uint64_t count) {
++    AddCounter(payload_bytes, bytes); AddCounter(records, count);
++  }
++  void AddPotential(uint64_t bytes, uint64_t count) {
++    AddCounter(reservation_bytes, bytes); AddCounter(reservation_records, count);
++  }
++  void Add(uint64_t bytes, uint64_t count) { AddOwned(bytes, count); AddPotential(bytes, count); }
++  void Merge(const TxOwnership& other) {
++    valid = valid && other.valid;
++    AddOwned(other.payload_bytes, other.records);
++    AddPotential(other.reservation_bytes, other.reservation_records);
++  }
++};
++}
++#endif
+--- a/api/portal_tx_snapshot_v2.h
++++ b/api/portal_tx_snapshot_v2.h
+@@ -0,0 +1,34 @@
++#ifndef WEBRTC_PORTAL_TX_SNAPSHOT_V2_H
++#define WEBRTC_PORTAL_TX_SNAPSHOT_V2_H
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++typedef struct webrtc_portal_tx_snapshot_v2 {
++  uint64_t owned_payload_bytes;
++  uint64_t owned_records;
++  uint64_t reservation_bytes;
++  uint64_t reservation_records;
++} webrtc_portal_tx_snapshot_v2;
++// state: 1 valid, 0 unavailable/overflow (fail closed), 2 socket destroyed.
++// Runs on the SDK network thread after the outer SCTP operation returns.
++// Store the snapshot and wake; never send/close/reenter the SDK in this callback.
++typedef void (*webrtc_portal_tx_notify_v2)(void*, const webrtc_portal_tx_snapshot_v2*, int state);
++// Call only on the actual SDK network thread, with DataChannelInterface*.
++// A null callback queries without binding. Binding must survive until state2.
++int webrtc_portal_tx_observe_v2(void* channel, webrtc_portal_tx_notify_v2 notify,
++                               void* user, webrtc_portal_tx_snapshot_v2* out);
++// Atomic with actual send on the SDK network thread. Ceilings are absolute
++// local limits, reduced by the provider's already-reserved global allowance.
++// 1=actual SCTP acceptance,0=no-send backpressure,-1=closed/invalid/unsupported.
++int webrtc_portal_tx_try_send_v2(void* channel, const void* data, int length,
++                               uint64_t reservation_byte_ceiling,
++                               uint64_t reservation_record_ceiling);
++// Passive observation prepays pending DCEP; activate only after reserving
++// the initial potential in the provider's peer/global account.1/0/-1 as documented.
++int webrtc_portal_tx_activate_v2(void* channel, uint64_t reservation_byte_ceiling,
++                               uint64_t reservation_record_ceiling);
++#ifdef __cplusplus
++}
++#endif
++#endif
+--- a/media/sctp/portal_tx_bridge.inc
++++ b/media/sctp/portal_tx_bridge.inc
+@@ -0,0 +1,243 @@
++#include <map>
++#include <mutex>
++#include "api/portal_tx_snapshot_v2.h"
++#include "api/portal_tx_channel_internal.h"
++#include "net/dcsctp/socket/dcsctp_socket.h"
++
++namespace portal_backend {
++struct Meta {
++  const void* channel = nullptr;
++  bool policy = false;
++  bool ready = false;
++  unsigned control_kind = 0;
++  uint64_t control_length = 0;
++};
++struct Binding {
++  webrtc_portal_tx_notify_v2 notify;
++  void* user;
++  const void* channel;
++  unsigned control_kind;
++  uint64_t pending_control_length;
++  bool active = false;
++  bool deferred = false;
++  unsigned depth = 0;
++  bool force = false;
++  webrtc_portal_tx_snapshot_v2 previous{};
++  bool has_previous = false;
++  rtc::scoped_refptr<webrtc::DataChannelInterface> channel_keepalive;
++};
++struct SendCapture {
++  const webrtc::DcSctpTransport* transport;
++  int length;
++  bool entered = false;
++  bool seen = false;
++  bool accepted = false;
++};
++std::mutex mutex;
++std::map<const webrtc::DcSctpTransport*, Binding> bindings;
++thread_local const webrtc::DcSctpTransport* captured = nullptr;
++thread_local bool capturing = false;
++thread_local Meta meta;
++thread_local SendCapture* send_capture = nullptr;
++thread_local const ControlPermit* control_permit = nullptr;
++
++void CaptureChannel(const webrtc::DataChannelInterface* channel, bool policy, bool ready,
++                    unsigned kind, uint64_t length) {
++  if (capturing) meta = {channel,policy,ready,kind,length};
++}
++bool AddPending(webrtc_portal_tx_snapshot_v2* value, uint64_t length) {
++  if (length > UINT64_MAX/2 || length == UINT64_MAX ||
++      2*length > UINT64_MAX-value->reservation_bytes ||
++      (length && length+1 > UINT64_MAX-value->reservation_records)) return false;
++  value->reservation_bytes += 2*length;
++  if (length) value->reservation_records += length+1;
++  return true;
++}
++bool AddControlPotential(const webrtc::DcSctpTransport* transport,
++                         webrtc_portal_tx_snapshot_v2* value) {
++  std::lock_guard<std::mutex> lock(mutex);
++  auto found = bindings.find(transport);
++  return found == bindings.end() || AddPending(value, found->second.pending_control_length);
++}
++bool Equal(const webrtc_portal_tx_snapshot_v2& a, const webrtc_portal_tx_snapshot_v2& b) {
++  return a.owned_payload_bytes==b.owned_payload_bytes && a.owned_records==b.owned_records &&
++         a.reservation_bytes==b.reservation_bytes && a.reservation_records==b.reservation_records;
++}
++void Notify(const webrtc::DcSctpTransport* transport, bool destroyed = false) {
++  webrtc_portal_tx_snapshot_v2 value{};
++  int state = destroyed ? 2 : (transport->GetPortalTxOwnership(&value) ? 1 : 0);
++  webrtc_portal_tx_notify_v2 notify = nullptr;
++  void* user = nullptr;
++  rtc::scoped_refptr<webrtc::DataChannelInterface> keepalive;
++  {
++    std::lock_guard<std::mutex> lock(mutex);
++    auto found = bindings.find(transport);
++    if (found==bindings.end()) return;
++    Binding& b=found->second;
++    if (!destroyed && b.depth) return;
++    if (state==1 && b.has_previous && !b.force && Equal(value,b.previous)) return;
++    notify=b.notify; user=b.user; b.previous=value; b.has_previous=state==1; b.force=false;
++    if (destroyed) { keepalive=std::move(b.channel_keepalive); bindings.erase(found); }
++  }
++  notify(user,&value,state);
++}
++class Operation {
++ public:
++  explicit Operation(const webrtc::DcSctpTransport* transport):transport_(transport) {
++    std::lock_guard<std::mutex> lock(mutex);
++    auto found=bindings.find(transport);
++    if (found!=bindings.end()) { ++found->second.depth; bound_=true; }
++  }
++  ~Operation() {
++    if (!bound_) return;
++    {
++      std::lock_guard<std::mutex> lock(mutex);
++      auto found=bindings.find(transport_);
++      if (found==bindings.end()) return;
++      --found->second.depth;
++    }
++    Notify(transport_);
++  }
++ private:
++  const webrtc::DcSctpTransport* transport_;
++  bool bound_=false;
++};
++bool Probe(void* channel, const webrtc::DcSctpTransport*& transport, Meta& result) {
++  if (!channel || capturing) return false;
++  captured=nullptr; meta={}; capturing=true;
++  static_cast<webrtc::DataChannelInterface*>(channel)->buffered_amount();
++  capturing=false; transport=captured; result=meta; captured=nullptr; meta={};
++  return transport && result.channel && result.policy;
++}
++bool DeferControl(const void* channel) {
++  std::lock_guard<std::mutex> lock(mutex);
++  for (auto& item:bindings) {
++    if (item.second.channel==channel && !item.second.active) {
++      item.second.deferred=true; return true;
++    }
++  }
++  return false;
++}
++void HandshakeChanged(const void* channel) {
++  const webrtc::DcSctpTransport* transport=nullptr;
++  {
++    std::lock_guard<std::mutex> lock(mutex);
++    for (auto& item:bindings) if (item.second.channel==channel) {
++      item.second.force=true; transport=item.first; break;
++    }
++  }
++  if (transport) Notify(transport);
++}
++bool SendPermitted(const webrtc::DcSctpTransport* transport,
++                   const webrtc::SendDataParams& params, size_t length) {
++  std::lock_guard<std::mutex> lock(mutex);
++  auto found=bindings.find(transport);
++  if (found==bindings.end()) return true;
++  Binding& b=found->second;
++  if (!b.active) return false;
++  if (params.type==webrtc::DataMessageType::kControl) {
++    if (!control_permit || !control_permit->policy || control_permit->channel!=b.channel ||
++        control_permit->kind!=b.control_kind || control_permit->length!=length ||
++        b.pending_control_length!=length || !length || params.max_rtx_count.has_value() ||
++        params.max_rtx_ms.has_value()) return false;
++    b.pending_control_length=0;
++    return true;
++  }
++  if (!send_capture || send_capture->transport!=transport || send_capture->entered ||
++      length!=static_cast<size_t>(send_capture->length) ||
++      params.type!=webrtc::DataMessageType::kBinary || params.ordered ||
++      !params.max_rtx_count.has_value() || *params.max_rtx_count!=0 ||
++      params.max_rtx_ms.has_value()) return false;
++  send_capture->entered=true;
++  return true;
++}
++void CaptureSend(const webrtc::DcSctpTransport* transport, dcsctp::SendStatus status) {
++  if (send_capture && send_capture->transport==transport) {
++    send_capture->seen=true; send_capture->accepted=status==dcsctp::SendStatus::kSuccess;
++  }
++}
++}  // namespace portal_backend
++
++extern "C" int webrtc_portal_tx_observe_v2(
++    void* channel,webrtc_portal_tx_notify_v2 notify,void* user,webrtc_portal_tx_snapshot_v2* out) {
++  using namespace portal_backend;
++  const webrtc::DcSctpTransport* transport=nullptr; Meta value;
++  if (!out || !Probe(channel,transport,value)) return 0;
++  bool exists=false;
++  {
++    std::lock_guard<std::mutex> lock(mutex);
++    auto found=bindings.find(transport);
++    if (found!=bindings.end()) {
++      if (found->second.channel!=value.channel ||
++          (notify && (found->second.notify!=notify || found->second.user!=user))) return 0;
++      exists=true;
++    }
++  }
++  if (!transport->GetPortalTxOwnership(out)) return 0;
++  if (exists) return 1;
++  if (!AddPending(out,value.control_length)) return 0;
++  if (!notify) return 1;
++  std::lock_guard<std::mutex> lock(mutex);
++  if (bindings.size()>=512) return 0;
++  Binding b{notify,user,value.channel,value.control_kind,value.control_length};
++  b.previous=*out; b.has_previous=true;
++  b.channel_keepalive=const_cast<webrtc::DataChannelInterface*>(
++      static_cast<const webrtc::DataChannelInterface*>(value.channel));
++  bindings.emplace(transport,b);
++  return 1;
++}
++
++extern "C" int webrtc_portal_tx_activate_v2(void* channel,uint64_t bytes,uint64_t records) {
++  using namespace portal_backend;
++  if (!channel || !bytes || bytes>65536 || !records) return -1;
++  const webrtc::DcSctpTransport* transport=nullptr; Meta meta;
++  if (!Probe(channel,transport,meta)) return -1;
++  webrtc_portal_tx_snapshot_v2 snapshot{};
++  if (!transport->GetPortalTxOwnership(&snapshot)) return -1;
++  if (snapshot.reservation_bytes>bytes || snapshot.reservation_records>records) return 0;
++  bool resume=false;
++  {
++    std::lock_guard<std::mutex> lock(mutex);
++    auto found=bindings.find(transport);
++    if (found==bindings.end() || found->second.channel!=meta.channel) return -1;
++    if (!found->second.active) {
++      found->second.active=true;
++      resume=found->second.deferred;
++      found->second.deferred=false;
++    }
++  }
++  // Retry only an already-deferred control; preserve the SDK's original callback ordering.
++  if (resume) ScheduleChannelResume(meta.channel);
++  return 1;
++}
++
++extern "C" int webrtc_portal_tx_try_send_v2(
++    void* channel,const void* data,int length,uint64_t bytes,uint64_t records) {
++  using namespace portal_backend;
++  if (!channel || !data || length<1 || length>1400 || send_capture ||
++      !bytes || bytes>65536 || !records) return -1;
++  rtc::scoped_refptr<webrtc::DataChannelInterface> owned(
++      static_cast<webrtc::DataChannelInterface*>(channel));
++  const webrtc::DcSctpTransport* transport=nullptr; Meta meta;
++  if (!Probe(channel,transport,meta)) return -1;
++  if (owned->state()==webrtc::DataChannelInterface::kClosing ||
++      owned->state()==webrtc::DataChannelInterface::kClosed) return -1;
++  {
++    std::lock_guard<std::mutex> lock(mutex);
++    auto found=bindings.find(transport);
++    if (found==bindings.end() || found->second.channel!=meta.channel) return -1;
++    if (!found->second.active || !meta.ready) return 0;
++  }
++  webrtc_portal_tx_snapshot_v2 snapshot{};
++  if (!transport->GetPortalTxOwnership(&snapshot)) return -1;
++  const uint64_t added_bytes=static_cast<uint64_t>(length)*2;
++  const uint64_t added_records=static_cast<uint64_t>(length)+1;
++  if (snapshot.reservation_bytes>bytes || added_bytes>bytes-snapshot.reservation_bytes ||
++      snapshot.reservation_records>records || added_records>records-snapshot.reservation_records) return 0;
++  SendCapture capture{transport,length}; send_capture=&capture;
++  const bool accepted=owned->Send(webrtc::DataBuffer(
++      rtc::CopyOnWriteBuffer(static_cast<const uint8_t*>(data),length),true));
++  send_capture=nullptr;
++  return accepted && capture.seen && capture.accepted &&
++         owned->state()==webrtc::DataChannelInterface::kOpen ? 1 : -1;
++}
+--- a/net/dcsctp/tx/outstanding_data.h
++++ b/net/dcsctp/tx/outstanding_data.h
+@@ -10,6 +10,7 @@
+ #ifndef NET_DCSCTP_TX_OUTSTANDING_DATA_H_
+ #define NET_DCSCTP_TX_OUTSTANDING_DATA_H_
+ 
++#include "net/dcsctp/public/tx_ownership.h"
+ #include <deque>
+ #include <map>
+ #include <set>
+@@ -110,6 +111,7 @@
+   // least once) chunks that have a limited lifetime.
+   void ExpireOutstandingChunks(webrtc::Timestamp now);
+ 
++  TxOwnership GetTxOwnership(const class RRSendQueue* prepaid = nullptr) const;
+   bool empty() const { return outstanding_data_.empty(); }
+ 
+   bool has_data_to_be_fast_retransmitted() const {
+--- a/net/dcsctp/tx/rr_send_queue.h
++++ b/net/dcsctp/tx/rr_send_queue.h
+@@ -10,6 +10,7 @@
+ #ifndef NET_DCSCTP_TX_RR_SEND_QUEUE_H_
+ #define NET_DCSCTP_TX_RR_SEND_QUEUE_H_
+ 
++#include "net/dcsctp/public/tx_ownership.h"
+ #include <cstdint>
+ #include <deque>
+ #include <map>
+@@ -64,6 +65,8 @@
+   // that the buffer is not full prior to adding new items to it.
+   bool IsFull() const;
+   // Indicates if the buffer is empty.
++  TxOwnership GetTxOwnership() const;
++  bool ContainsMessage(StreamID stream, OutgoingMessageId message) const;
+   bool IsEmpty() const;
+ 
+   // Adds the message to be sent using the `send_options` provided. The current
+@@ -148,6 +151,8 @@
+           next_ssn_(SSN(state ? state->next_ssn : 0)),
+           buffered_amount_(std::move(on_buffered_amount_low)) {}
+ 
++    TxOwnership GetTxOwnership() const;
++    bool ContainsMessage(OutgoingMessageId message) const;
+     StreamID stream_id() const { return scheduler_stream_->stream_id(); }
+ 
+     // Enqueues a message to this stream.
+--- a/net/dcsctp/socket/dcsctp_socket.h
++++ b/net/dcsctp/socket/dcsctp_socket.h
+@@ -10,6 +10,7 @@
+ #ifndef NET_DCSCTP_SOCKET_DCSCTP_SOCKET_H_
+ #define NET_DCSCTP_SOCKET_DCSCTP_SOCKET_H_
+ 
++#include "net/dcsctp/public/tx_ownership.h"
+ #include <cstdint>
+ #include <memory>
+ #include <string>
+@@ -95,6 +96,7 @@
+                                    const SendOptions& send_options) override;
+   ResetStreamsStatus ResetStreams(
+       rtc::ArrayView<const StreamID> outgoing_streams) override;
++  TxOwnership GetTxOwnership() const;
+   SocketState state() const override;
+   const DcSctpOptions& options() const override { return options_; }
+   void SetMaxMessageSize(size_t max_message_size) override;
+--- a/net/dcsctp/tx/retransmission_queue.h
++++ b/net/dcsctp/tx/retransmission_queue.h
+@@ -121,6 +121,7 @@
+   uint64_t rtx_bytes_count() const { return rtx_bytes_count_; }
+ 
+   // Returns the number of bytes of packets that are in-flight.
++  TxOwnership GetTxOwnership(const RRSendQueue* prepaid = nullptr) const { return outstanding_data_.GetTxOwnership(prepaid); }
+   size_t unacked_bytes() const { return outstanding_data_.unacked_bytes(); }
+ 
+   // Returns the number of DATA chunks that are in-flight.
+--- a/net/dcsctp/tx/outstanding_data.cc
++++ b/net/dcsctp/tx/outstanding_data.cc
+@@ -8,6 +8,7 @@
+  *  be found in the AUTHORS file in the root of the source tree.
+  */
+ #include "net/dcsctp/tx/outstanding_data.h"
++#include "net/dcsctp/tx/rr_send_queue.h"
+ 
+ #include <algorithm>
+ #include <set>
+@@ -32,6 +33,16 @@
+ // Returns how large a chunk will be, serialized, carrying the data
+ size_t OutstandingData::GetSerializedChunkSize(const Data& data) const {
+   return RoundUpTo4(data_chunk_header_size_ + data.size());
++}
++
++TxOwnership OutstandingData::GetTxOwnership(const RRSendQueue* prepaid) const {
++  TxOwnership result;
++  for (const Item& item : outstanding_data_) {
++    result.AddOwned(item.data().payload.size(), 1);
++    if (!prepaid || !prepaid->ContainsMessage(item.data().stream_id, item.message_id()))
++      result.AddPotential(item.data().payload.size(), 1);
++  }
++  return result;
+ }
+ 
+ void OutstandingData::Item::Ack() {
+--- a/net/dcsctp/tx/rr_send_queue.cc
++++ b/net/dcsctp/tx/rr_send_queue.cc
+@@ -349,6 +349,38 @@
+   return items_.front().mid.has_value();
+ }
+ 
++TxOwnership RRSendQueue::OutgoingStream::GetTxOwnership() const {
++  TxOwnership result;
++  // Partially produced entries still retain the entire original vector.
++  for (const Item& item : items_) {
++    const uint64_t bytes = item.message.payload().size();
++    result.AddOwned(bytes, 1);
++    // Original plus a complete fragment family, including reproduction after Reset.
++    result.AddPotential(bytes, bytes);
++    result.AddPotential(bytes, 1);
++  }
++  return result;
++}
++
++bool RRSendQueue::OutgoingStream::ContainsMessage(OutgoingMessageId message) const {
++  // Only the stream front can have produced fragments.
++  return !items_.empty() && items_.front().message_id == message;
++}
++
++bool RRSendQueue::ContainsMessage(StreamID stream, OutgoingMessageId message) const {
++  auto found = streams_.find(stream);
++  return found != streams_.end() && found->second.ContainsMessage(message);
++}
++
++TxOwnership RRSendQueue::GetTxOwnership() const {
++  TxOwnership result;
++  for (const auto& stream : streams_) {
++    auto owned = stream.second.GetTxOwnership();
++    result.Merge(owned);
++  }
++  return result;
++}
++
+ void RRSendQueue::Add(Timestamp now,
+                       DcSctpMessage message,
+                       const SendOptions& send_options) {
+--- a/net/dcsctp/socket/dcsctp_socket.cc
++++ b/net/dcsctp/socket/dcsctp_socket.cc
+@@ -421,6 +421,15 @@
+   RTC_DCHECK(IsConsistent());
+ }
+ 
++TxOwnership DcSctpSocket::GetTxOwnership() const {
++  auto result = send_queue_.GetTxOwnership();
++  if (tcb_) {
++    auto owned = tcb_->retransmission_queue().GetTxOwnership(&send_queue_);
++    result.Merge(owned);
++  }
++  return result;
++}
++
+ void DcSctpSocket::Close() {
+   CallbackDeferrer::ScopedDeferrer deferrer(callbacks_);
+ 
+--- a/media/sctp/dcsctp_transport.h
++++ b/media/sctp/dcsctp_transport.h
+@@ -12,6 +12,7 @@
+ #define MEDIA_SCTP_DCSCTP_TRANSPORT_H_
+ 
+ #include <memory>
++#include "api/portal_tx_snapshot_v2.h"
+ #include <string>
+ 
+ #include "absl/strings/string_view.h"
+@@ -50,6 +51,7 @@
+                   std::unique_ptr<dcsctp::DcSctpSocketFactory> socket_factory);
+   ~DcSctpTransport() override;
+ 
++  bool GetPortalTxOwnership(webrtc_portal_tx_snapshot_v2* out) const;
+   // cricket::SctpTransportInternal
+   void SetOnConnectedCallback(std::function<void()> callback) override;
+   void SetDataChannelSink(DataChannelSink* sink) override;
+--- a/media/sctp/dcsctp_transport.cc
++++ b/media/sctp/dcsctp_transport.cc
+@@ -35,6 +35,7 @@
+ #include "rtc_base/thread.h"
+ #include "rtc_base/trace_event.h"
+ #include "system_wrappers/include/clock.h"
++#include "media/sctp/portal_tx_bridge.inc"
+ 
+ namespace webrtc {
+ 
+@@ -137,6 +138,7 @@
+           *network_thread,
+           [this]() { return TimeMillis(); },
+           [this](dcsctp::TimeoutID timeout_id) {
++            portal_backend::Operation operation(this);
+             socket_->HandleTimeout(timeout_id);
+           }) {
+   RTC_DCHECK_RUN_ON(network_thread_);
+@@ -150,7 +152,9 @@
+ DcSctpTransport::~DcSctpTransport() {
+   if (socket_) {
+     socket_->Close();
+-  }
++    socket_.reset();
++  }
++  portal_backend::Notify(this, true);
+ }
+ 
+ void DcSctpTransport::SetOnConnectedCallback(std::function<void()> callback) {
+@@ -234,6 +238,7 @@
+ }
+ 
+ bool DcSctpTransport::ResetStream(int sid) {
++  portal_backend::Operation operation(this);
+   RTC_DCHECK_RUN_ON(network_thread_);
+   RTC_DLOG(LS_INFO) << debug_name_ << "->ResetStream(" << sid << ").";
+   if (!socket_) {
+@@ -266,7 +271,9 @@
+ RTCError DcSctpTransport::SendData(int sid,
+                                    const SendDataParams& params,
+                                    const rtc::CopyOnWriteBuffer& payload) {
+-  RTC_DCHECK_RUN_ON(network_thread_);
++  portal_backend::Operation operation(this);
++  RTC_DCHECK_RUN_ON(network_thread_);
++  if (!portal_backend::SendPermitted(this, params, payload.size())) return RTCError(RTCErrorType::INVALID_STATE);
+   RTC_DLOG(LS_VERBOSE) << debug_name_ << "->SendData(sid=" << sid
+                        << ", type=" << static_cast<int>(params.type)
+                        << ", length=" << payload.size() << ").";
+@@ -339,6 +346,7 @@
+   }
+ 
+   dcsctp::SendStatus error = socket_->Send(std::move(message), send_options);
++  portal_backend::CaptureSend(this, error);
+   switch (error) {
+     case dcsctp::SendStatus::kSuccess:
+       return RTCError::OK();
+@@ -380,7 +388,27 @@
+   return socket_->options().announced_maximum_incoming_streams;
+ }
+ 
++bool DcSctpTransport::GetPortalTxOwnership(webrtc_portal_tx_snapshot_v2* out) const {
++  if (!out || !network_thread_->IsCurrent()) return false;
++  *out = {};
++  if (!socket_) return false;
++  auto* socket = dynamic_cast<dcsctp::DcSctpSocket*>(socket_.get());
++  if (!socket) return false;
++  auto owned = socket->GetTxOwnership();
++  if (!owned.valid) return false;
++  // The total covers every stream and ACKed/abandoned fragment in this association.
++  out->owned_payload_bytes = owned.payload_bytes;
++  out->owned_records = owned.records;
++  out->reservation_bytes = owned.reservation_bytes;
++  out->reservation_records = owned.reservation_records;
++  if (!portal_backend::AddControlPotential(this, out)) return false;
++  if (owned.reservation_bytes < owned.payload_bytes || owned.reservation_records < owned.records)
++    return false;
++  return true;
++}
++
+ size_t DcSctpTransport::buffered_amount(int sid) const {
++  if (portal_backend::capturing) portal_backend::captured = this;
+   if (!socket_)
+     return 0;
+   return socket_->buffered_amount(dcsctp::StreamID(sid));
+@@ -673,6 +701,7 @@
+ void DcSctpTransport::OnTransportReadPacket(
+     rtc::PacketTransportInternal* transport,
+     const rtc::ReceivedPacket& packet) {
++  portal_backend::Operation operation(this);
+   RTC_DCHECK_RUN_ON(network_thread_);
+   if (packet.decryption_info() != rtc::ReceivedPacket::kDtlsDecrypted) {
+     // We are only interested in SCTP packets.
+@@ -687,6 +716,7 @@
+ }
+ 
+ void DcSctpTransport::MaybeConnectSocket() {
++  portal_backend::Operation operation(this);
+   if (transport_ && transport_->writable() && socket_ &&
+       socket_->state() == dcsctp::SocketState::kClosed) {
+     socket_->Connect();
+--- a/api/portal_tx_channel_internal.h
++++ b/api/portal_tx_channel_internal.h
+@@ -0,0 +1,27 @@
++#ifndef WEBRTC_PORTAL_TX_CHANNEL_INTERNAL_H
++#define WEBRTC_PORTAL_TX_CHANNEL_INTERNAL_H
++#include <cstdint>
++namespace webrtc { class DataChannelInterface; }
++namespace portal_backend {
++void CaptureChannel(const webrtc::DataChannelInterface*, bool policy, bool ready, unsigned control_kind, uint64_t control_length);
++bool DeferControl(const void*);
++void HandshakeChanged(const void*);
++void ScheduleChannelResume(const void*);
++struct ControlPermit {
++  const void* channel;
++  unsigned kind;
++  uint64_t length;
++  bool policy;
++};
++extern thread_local const ControlPermit* control_permit;
++class ControlScope {
++ public:
++  ControlScope(const void* channel, unsigned kind, uint64_t length, bool policy)
++      : permit_{channel,kind,length,policy}, previous_(control_permit) { control_permit = &permit_; }
++  ~ControlScope() { control_permit = previous_; }
++ private:
++  ControlPermit permit_;
++  const ControlPermit* previous_;
++};
++}
++#endif
+--- a/pc/sctp_data_channel.cc
++++ b/pc/sctp_data_channel.cc
+@@ -9,6 +9,7 @@
+  */
+ 
+ #include "pc/sctp_data_channel.h"
++#include "api/portal_tx_channel_internal.h"
+ 
+ #include <limits>
+ #include <memory>
+@@ -337,6 +338,7 @@
+   switch (config.open_handshake_role) {
+     case InternalDataChannelInit::kNone:  // pre-negotiated
+       handshake_state_ = kHandshakeReady;
++      portal_backend::HandshakeChanged(this);
+       break;
+     case InternalDataChannelInit::kOpener:
+       handshake_state_ = kHandshakeShouldSendOpen;
+@@ -483,8 +485,25 @@
+   return priority_ ? *priority_ : Priority::kLow;
+ }
+ 
++void SctpDataChannel::SchedulePortalResume() {
++  RTC_DCHECK_RUN_ON(network_thread_);
++  rtc::scoped_refptr<SctpDataChannel> self(this);
++  network_thread_->PostTask([self] {
++    if (self->state() != kClosed) self->OnTransportReady();
++  });
++}
++
+ uint64_t SctpDataChannel::buffered_amount() const {
+   RTC_DCHECK_RUN_ON(network_thread_);
++  const unsigned kind = handshake_state_ == kHandshakeShouldSendOpen ? 3 :
++                        handshake_state_ == kHandshakeShouldSendAck ? 2 : 0;
++  const bool size_valid = label_.size() <= 65535 && protocol_.size() <= 65535;
++  const bool policy = !ordered_ && max_retransmits_.has_value() && *max_retransmits_ == 0 &&
++                      !max_retransmit_time_.has_value() && size_valid;
++  const uint64_t pending = kind == 2 ? 1 : kind == 3 && size_valid ?
++                           12 + label_.size() + protocol_.size() : 0;
++  portal_backend::CaptureChannel(this, policy,
++      state_ == kOpen && handshake_state_ == kHandshakeReady, kind, pending);
+   if (controller_ != nullptr && id_n_.has_value()) {
+     return controller_->buffered_amount(*id_n_);
+   }
+@@ -695,6 +714,7 @@
+     if (ParseDataChannelOpenAckMessage(payload)) {
+       // We can send unordered as soon as we receive the ACK message.
+       handshake_state_ = kHandshakeReady;
++      portal_backend::HandshakeChanged(this);
+       RTC_LOG(LS_INFO) << "DataChannel received OPEN_ACK message, sid = "
+                        << id_n_->stream_id_int();
+     } else {
+@@ -715,6 +735,7 @@
+   // OPEN_ACK).
+   if (handshake_state_ == kHandshakeWaitingForAck) {
+     handshake_state_ = kHandshakeReady;
++      portal_backend::HandshakeChanged(this);
+   }
+ 
+   bool binary = (type == DataMessageType::kBinary);
+@@ -952,11 +973,15 @@
+ 
+ // RTC_RUN_ON(network_thread_).
+ bool SctpDataChannel::SendControlMessage(const rtc::CopyOnWriteBuffer& buffer) {
++  if (portal_backend::DeferControl(this)) return false;
+   RTC_DCHECK(connected_to_transport());
+   RTC_DCHECK(id_n_.has_value());
+   RTC_DCHECK(controller_);
+ 
+   bool is_open_message = handshake_state_ == kHandshakeShouldSendOpen;
++  const bool policy = !ordered_ && max_retransmits_.has_value() && *max_retransmits_ == 0 &&
++                      !max_retransmit_time_.has_value();
++  portal_backend::ControlScope control(this, is_open_message ? 3 : 2, buffer.size(), policy);
+   RTC_DCHECK(!is_open_message || !negotiated_);
+ 
+   SendDataParams send_params;
+@@ -973,6 +998,7 @@
+ 
+     if (handshake_state_ == kHandshakeShouldSendAck) {
+       handshake_state_ = kHandshakeReady;
++      portal_backend::HandshakeChanged(this);
+     } else if (handshake_state_ == kHandshakeShouldSendOpen) {
+       handshake_state_ = kHandshakeWaitingForAck;
+     }
+@@ -992,3 +1018,9 @@
+ }
+ 
+ }  // namespace webrtc
++
++namespace portal_backend {
++void ScheduleChannelResume(const void* channel) {
++  const_cast<webrtc::SctpDataChannel*>(static_cast<const webrtc::SctpDataChannel*>(channel))->SchedulePortalResume();
++}
++}
+--- a/pc/sctp_data_channel.h
++++ b/pc/sctp_data_channel.h
+@@ -229,6 +229,7 @@
+   // Reset the allocator for internal ID values for testing, so that
+   // the internal IDs generated are predictable. Test only.
+   static void ResetInternalIdAllocatorForTesting(int new_value);
++  void SchedulePortalResume();
+ 
+  protected:
+   SctpDataChannel(const InternalDataChannelInit& config,

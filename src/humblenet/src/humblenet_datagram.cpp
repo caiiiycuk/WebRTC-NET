@@ -67,6 +67,10 @@ static void datagram_flush( datagram_connection& dg, const char* reason ) {
 						Module.onNetworkError($0);
 					}
 				), dg.peer);
+#else
+    // Native owners consume the resulting closed-route event before their final send.
+    humblenet_connection_set_closed(dg.conn);
+    dg.buf_out.clear();
 #endif
 				humblenet_clear_error();
 			}
@@ -129,6 +133,17 @@ int humblenet_datagram_recv( void* buffer, size_t length, int flags, Connection*
 		}
 		queuedPackets = false;
 	}
+
+#ifndef EMSCRIPTEN
+ // Deliver the old lifetime's close before any replacement's buffered packet.
+ for (auto it = connections.begin(); it != connections.end(); ++it) {
+  if (humblenet_connection_status(it->first) == HUMBLENET_CONNECTION_CLOSED) {
+   *fromconn = it->first;
+   connections.erase(it);
+   return -1;
+  }
+ }
+#endif
 
 	// first we drain all existing packets.
 	for( ConnectionMap::iterator it = connections.begin(); it != connections.end(); ++it ) {

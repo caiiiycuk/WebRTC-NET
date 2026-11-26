@@ -84,7 +84,52 @@ Native clients must provide their own ICE server list with
 `peer-server` is used for peer matching and signaling only, so STUN/TURN
 configuration must be supplied by the application.
 
-HumbleNet aborts P2P startup when the final ICE server list is empty. Web
+Linux portal ABI
+----------------
+
+`humblenet_portal.h` defines an opt-in, lifetime-scoped ABI. Pass
+`HUMBLENET_PORTAL_ABI` in the options and check every capability in
+`HUMBLENET_PORTAL_CAPS_V1` before enabling it, before P2P initialization. The
+backend requires the pinned SDK's V2 send seam and advertises **0x1f**, including
+actual SCTP payload ownership and send-credit retirement. Ordinary callers
+and the existing `humblenet_dz_*` ABI retain their defaults.
+
+The portal reserves at most 160 connections, including unreclaimed closing, and
+8 pending lifetimes before PeerConnection allocation. Pending includes RTC OPEN
+and the application handshake. `started` transfers the initial15s deadline to
+the application; only `established(peer,lifetime)` releases pending once, on the
+first valid post-acceptance sequenced packet. A never-established closing
+lifetime holds pending until reclaim. CLOSE is logical; consume it and call
+`release`, then retain ownership until RECLAIM. Retained close/tombstone state
+has 512 slots and expires using monotonic time without repeated same-peer lookups.
+
+Poll the borrowed eventfd; never read, write or close it. Call `service` to reset
+and rearm notifications under producer synchronization, then receive at most128
+events before servicing other fds. Receive rotates peers and returns complete
+raw1..1400-byte datagrams with monotonic ingress timestamps. There is no added
+game framing or prefix delivery. The fixed ingress ring holds 32 messages per
+peer. Its allocation budget is `sizeof(records) + 160 * sizeof(Inbox)`.
+The SDK callback queue has a separate 1 MiB payload limit.
+Only one unordered, maxRetransmits0 DataChannel is accepted per lifetime.
+
+Send results are accepted1 (whole backend handoff, not remote receipt),
+backpressure0 (whole drop, no retry queue or fatal close), and closed-1.
+V2 egress admission caps reservation potential at64KiB per peer/1MiB globally
+and4096/65536 potential record units per peer/globally. A new n-byte datagram
+reserves2n bytes and n+1 record units before the SDK guarded send; queued
+originals retain their complete fragment-family/restart prepayment. Absolute
+snapshots retire credits while other traffic remains owned. `buffered_amount`
+alone excludes retained SCTP payloads and cannot qualify that contract.
+The public `egress_buffered_bytes` gauge reports actual retained payload bytes;
+the SDK snapshot separately reports actual owned records and byte/record
+reservation potential. Record units do not claim allocator/RSS size. Unknown
+snapshot state latches admission closed; it never becomes zero ownership.
+Stats expose monotonic refusal,
+oversize, pressure and send-outcome counters plus current reservations,
+pending/closing/retained records and owned-byte gauges. These limits do not
+claim total RSS or DTLS/SCTP reassembly bounds, gameplay or performance acceptance.
+
+HumbleNet rejects P2P startup when the final ICE server list is empty. Web
 builds use `window.netConfig.iceServers` only when
 `humblenet_set_iceservers()` was not called explicitly. A STUN-only list is
 accepted, but produces a prominent warning because reliable connectivity

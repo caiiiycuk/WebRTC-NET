@@ -1,4 +1,5 @@
 #include "libsocket.h"
+#include "humblenet_portal_internal.h"
 
 #include <map>
 #include <condition_variable>
@@ -47,7 +48,7 @@ struct internal_socket_t {
 	
 	// webrtc connection info
 	struct libwebrtc_connection* webrtc;
-	struct libwebrtc_data_channel* webrtc_channel;
+	std::atomic<struct libwebrtc_data_channel*> webrtc_channel; // portal send reads it off the signaling thread
 	
 	internal_socket_t(bool owner=true)
 	:owner(owner)
@@ -320,6 +321,11 @@ int webrtc_protocol(struct libwebrtc_context *context,
 
 		case LWRTC_CALLBACK_CHANNEL_CLOSED:
 			socket->webrtc_channel = NULL;
+            if (portal_enabled()) {
+                socket->closing = true;
+                ret = socket->callbacks.on_disconnect(socket, socket->user_data);
+                break;
+            }
 
 			// we are 1-1 DC -> channel, otherwise we would delegate this up.
 			// socket->callbacks.on_disconnect_channel( socket, socket->user_data );
@@ -413,6 +419,14 @@ internal_context_t* internal_init(internal_callbacks_t* callbacks) {
 		return NULL;
 	}
 	ctx->webrtc = libwebrtc_create_context(&webrtc_protocol);
+#ifndef EMSCRIPTEN
+    if (ctx->webrtc && portal_enabled()) {
+        const auto *api = libwebrtc_portal_api();
+        if (!api || !api->enable(ctx->webrtc, portal_notify, nullptr)) {
+            libwebrtc_destroy_context(ctx->webrtc); ctx->webrtc = nullptr;
+        }
+    }
+#endif
 	if (ctx->webrtc == NULL) {
 		lws_context* websocket = ctx->websocket;
 		ctx->websocket = NULL;
@@ -620,8 +634,9 @@ internal_socket_t* internal_create_webrtc(internal_context_t* ctx) {
 	internal_socket_t* socket = new internal_socket_t(true);
 	socket->context = ctx;
 
-	socket->webrtc = libwebrtc_create_connection_extended( ctx->webrtc, socket );
-	socket->callbacks = ctx->callbacks;
+	 socket->webrtc = libwebrtc_create_connection_extended(ctx->webrtc, socket);
+    if (!socket->webrtc) { delete socket; return nullptr; }
+	 socket->callbacks = ctx->callbacks;
 
 	return socket;
 }
@@ -761,4 +776,30 @@ int internal_websocket_message_complete(internal_socket_t* socket)
 	}
 #endif
 	return 1;
+}
+
+int internal_portal_write(internal_socket_t *socket, const void *data, unsigned int length) {
+#ifndef EMSCRIPTEN
+    const auto *api = libwebrtc_portal_api();
+    auto *channel = socket ? socket->webrtc_channel.load() : nullptr;
+    return channel && api ? api->write(channel, data, length) : -1;
+#else
+    return -1;
+#endif
+}
+int internal_portal_reclaim(internal_socket_t *socket) {
+#ifndef EMSCRIPTEN
+    const auto *api = libwebrtc_portal_api();
+    return socket && socket->webrtc && api ? api->reclaim(socket->webrtc) : 0;
+#else
+    return 0;
+#endif
+}
+unsigned long long internal_portal_buffered(internal_context_t *ctx) {
+#ifndef EMSCRIPTEN
+    const auto *api = libwebrtc_portal_api();
+    return ctx && ctx->webrtc && api ? api->buffered(ctx->webrtc) : 0;
+#else
+    return 0;
+#endif
 }

@@ -49,6 +49,12 @@ jobs:
 
     - name: Build ALL
       run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}}
+
+    - name: Check portal ABI without the optional SDK overlay
+      run: |
+        LD_LIBRARY_PATH="$PWD/build" ./build/humblenet_test_portal.bin.x86_64 0
+        python3 tests/test_portal_sdk.py
+        printf '#include "humblenet_p2p.h"\n' | cc -std=c11 -Werror -Isrc/humblenet/include -x c -fsyntax-only -
     
     - name: Build humblenet_asmjs_amalgamation
       run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --target humblenet_asmjs_amalgamation

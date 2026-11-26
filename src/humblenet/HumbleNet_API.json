@@ -180,6 +180,25 @@
 			"options" : [
 				"native"
 			]
-		}
-	]
+		},
+{"functionname": "humblenet_dz_signaling_state", "returntype": "int", "params": [{"paramname": "generation", "paramtype": "uint64_t *"}]},
+{"functionname": "humblenet_dz_alias_state", "returntype": "int", "params": [{"paramname": "alias", "paramtype": "const char *"}, {"paramname": "peer", "paramtype": "PeerId *"}, {"paramname": "generation", "paramtype": "uint64_t *"}]},
+{"functionname": "humblenet_dz_route_for_peer", "returntype": "PeerId", "params": [{"paramname": "peer", "paramtype": "PeerId"}]},
+{"functionname": "humblenet_dz_backend_path", "returntype": "const char *"},
+{"functionname": "humblenet_dz_connection_state", "returntype": "int", "params": [{"paramname": "peer", "paramtype": "PeerId"}, {"paramname": "lifetime", "paramtype": "uint64_t *"}]},
+{"functionname": "humblenet_dz_recvfrom", "returntype": "int", "params": [{"paramname": "buffer", "paramtype": "void *"}, {"paramname": "length", "paramtype": "uint32_t"}, {"paramname": "peer", "paramtype": "PeerId *"}, {"paramname": "channel", "paramtype": "uint8_t"}, {"paramname": "lifetime", "paramtype": "uint64_t *"}]},
+{"functionname": "humblenet_dz_disconnect", "returntype": "ha_bool", "params": [{"paramname": "peer", "paramtype": "PeerId"}, {"paramname": "lifetime", "paramtype": "uint64_t"}]},
+{"functionname": "humblenet_portal_capabilities", "returntype": "uint64_t"},
+{"functionname": "humblenet_portal_enable", "returntype": "ha_bool", "params": [{"paramname": "options", "paramtype": "const humblenet_portal_options *"}]},
+{"functionname": "humblenet_portal_set_admission", "returntype": "void", "params": [{"paramname": "enabled", "paramtype": "ha_bool"}]},
+{"functionname": "humblenet_portal_event_fd", "returntype": "int"},
+{"functionname": "humblenet_portal_service", "returntype": "void"},
+{"functionname": "humblenet_portal_recv", "returntype": "int", "params": [{"paramname": "buffer", "paramtype": "void *"}, {"paramname": "capacity", "paramtype": "uint32_t"}, {"paramname": "event", "paramtype": "humblenet_portal_event *"}]},
+{"functionname": "humblenet_portal_send", "returntype": "int", "params": [{"paramname": "peer", "paramtype": "PeerId"}, {"paramname": "lifetime", "paramtype": "uint64_t"}, {"paramname": "data", "paramtype": "const void *"}, {"paramname": "length", "paramtype": "uint32_t"}]},
+{"functionname": "humblenet_portal_started", "returntype": "ha_bool", "params": [{"paramname": "peer", "paramtype": "PeerId"}, {"paramname": "lifetime", "paramtype": "uint64_t"}]},
+{"functionname": "humblenet_portal_connection_state", "returntype": "int", "params": [{"paramname": "peer", "paramtype": "PeerId"}, {"paramname": "lifetime", "paramtype": "uint64_t"}]},
+{"functionname": "humblenet_portal_disconnect", "returntype": "ha_bool", "params": [{"paramname": "peer", "paramtype": "PeerId"}, {"paramname": "lifetime", "paramtype": "uint64_t"}]},
+{"functionname": "humblenet_portal_release", "returntype": "ha_bool", "params": [{"paramname": "peer", "paramtype": "PeerId"}, {"paramname": "lifetime", "paramtype": "uint64_t"}]},
+{"functionname": "humblenet_portal_get_stats", "returntype": "void", "params": [{"paramname": "stats", "paramtype": "humblenet_portal_stats *"}]},
+{"functionname": "humblenet_portal_established", "returntype": "ha_bool", "params": [{"paramname": "peer", "paramtype": "PeerId"}, {"paramname": "lifetime", "paramtype": "uint64_t"}]}]
 }

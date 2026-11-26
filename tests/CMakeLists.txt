@@ -69,6 +69,13 @@ if(HUMBLENET_DESKTOP)
 	)
 
 	add_dependencies(humblenet_test_loader humblenet_shared)
+	CreateTool(humblenet_test_portal
+	FILES
+		portal_abi.cpp
+	LINK
+		humblenet_shared
+	)
+	list(APPEND TEST_TARGETS humblenet_test_portal)
 endif()
 
 CreateTool(humblenet_hello_world
