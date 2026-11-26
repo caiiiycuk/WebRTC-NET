@@ -479,6 +479,11 @@ Connection *humblenet_connect_peer(PeerId peer_id) {
 		HUMBLENET_UNGUARD();
 		connection->socket = internal_create_webrtc(humbleNetState.context);
 	}
+	if( ! connection->socket ) {
+		humblenet_set_error("Unable to create WebRTC connection");
+		humblenet_connection_close(connection);
+		return NULL;
+	}
 	internal_set_data(connection->socket, connection);
 
 	humbleNetState.pendingPeerConnectionsOut.emplace(peer_id, connection);

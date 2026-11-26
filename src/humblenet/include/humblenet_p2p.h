@@ -1,10 +1,12 @@
 #ifndef HUMBLENET_P2P_H
 #define HUMBLENET_P2P_H
 
+#ifdef __cplusplus
 #include <functional>
 #include <string>
 #include <tuple>
 #include <vector>
+#endif
 
 #include "humblenet.h"
 
@@ -58,7 +60,9 @@ HUMBLENET_API ha_bool HUMBLENET_CALL humblenet_p2p_unregister_alias(const char* 
 HUMBLENET_API PeerId HUMBLENET_CALL humblenet_p2p_virtual_peer_for_alias(const char* name);
 
 
+#ifdef __cplusplus
 HUMBLENET_API ha_bool HUMBLENET_CALL humblenet_p2p_alias_query(const char* query, const std::function<void(std::vector<std::pair<std::string,PeerId>>)>& callback);
+#endif
 
 /*
 * Send a message to a peer.
