@@ -1,7 +1,11 @@
 # Changelog
 
-Generated from repository tags. `v1.1.3` is the current `HEAD` version.
+Generated from repository tags. `v1.1.4` is the current `HEAD` version.
 Merge commits are omitted when they only duplicate the commits they merge.
+
+## v1.1.4 - 2026-11-27
+
+- e9407cf fix: native uptime milliseconds and WebRTC connection creation failure
 
 ## v1.1.3 - 2026-11-12
 
