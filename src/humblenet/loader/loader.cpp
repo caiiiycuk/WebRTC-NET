@@ -1,3 +1,4 @@
+#include "humblenet_portal.h"
 #include "humblenet.h"
 #include "humblenet_p2p.h"
 

@@ -1,0 +1,97 @@
+{
+  "schema": 1,
+  "sdk_version": "6422.8505a9.224",
+  "source_revision": "8505a9838ea91c66c96c173d30cd66f9dbcc7548",
+  "pin_recipe": "d146ad1b017245cf1331a647c887259cbc6b8607",
+  "qualification": "REVIEWED_V2_DCEP_KEEPALIVE_FIVE_OBJECT_SDK",
+  "patch_sha256": "899422100755de479f423f56c389af14499a0ead1e148da01ff42ed91083c51a",
+  "public_header_sha256": "0b8afc06ff22e61dbf41691259aafce48220a3fa14b72ad38ee367c8bceb0cba",
+  "compiler_sha256": "3d9ccf167693aa81f7e99dee0ff87691edda3f2d65d1f127f25f6c46bb8e8744",
+  "compiler_version": "clang 23.1.1",
+  "libraries": {
+    "libwebrtc.a": "109fef91d091846474baae2ad70ca272428dbe8d8559c03f3b7c596389e787d7",
+    "libboringssl.a": "d704c68acaedfd852a2341214c5b146a39226e4969d9272dfb9f94ed9452f9c7",
+    "libyuv_internal.a": "558ff7ca312f727cb5155cb8ba52768f9a2de0e56d6c9ccb92286cf156d703da"
+  },
+  "files": [
+    {
+      "path": "net/dcsctp/public/tx_ownership.h",
+      "base_sha256": null,
+      "patched_sha256": "5e558afb00858cb9a0f3d1babb022e208bae7f36583c38a56d651e30ef22010d"
+    },
+    {
+      "path": "api/portal_tx_snapshot_v2.h",
+      "base_sha256": null,
+      "patched_sha256": "0b8afc06ff22e61dbf41691259aafce48220a3fa14b72ad38ee367c8bceb0cba"
+    },
+    {
+      "path": "media/sctp/portal_tx_bridge.inc",
+      "base_sha256": null,
+      "patched_sha256": "d07a21d6b523d6ccbd4bd80bd8c0e6e0aefb02811e3feca0ac17294e57321311"
+    },
+    {
+      "path": "net/dcsctp/tx/outstanding_data.h",
+      "base_sha256": "d73ff8cee4f07556700bc816a5f9e259ddbe4a5345acfcdd3546c9f60d72433d",
+      "patched_sha256": "697140ff551ffeebfa118244f2d4c037faac6f94e43861370ccd12e99a3d6628"
+    },
+    {
+      "path": "net/dcsctp/tx/rr_send_queue.h",
+      "base_sha256": "dac0bee9bf9524323ccdd1d73dd6c88339e345126c0fc1554ff38e599fe8e49f",
+      "patched_sha256": "d3101eb1dbdb90ef0bc1dc381877783bd31a4d26e6b58eb9b3969e17e2bd6fec"
+    },
+    {
+      "path": "net/dcsctp/socket/dcsctp_socket.h",
+      "base_sha256": "1b048362842dc1cfa0b396fef0c9091a2e576d7f47f4efd58a08dc7209943f5e",
+      "patched_sha256": "8bbed1e717cf4064a6ccb7f6b71e97773292a9469c923b430a48c378e9260769"
+    },
+    {
+      "path": "net/dcsctp/tx/retransmission_queue.h",
+      "base_sha256": "c125a90e9f141ebd65eebbbad3869a53623e5a776ec112e89f355d3ba1889ff0",
+      "patched_sha256": "25e1327e793f9e2e47f6ca2beceb5130ea33fb21835201aec0dc13342669acc7"
+    },
+    {
+      "path": "net/dcsctp/tx/outstanding_data.cc",
+      "base_sha256": "ea3e1d6a5aeec42c2f02c6908fcf0b7a9eb0446b15531be81b6728362bb05c02",
+      "patched_sha256": "0f121025355b11d3d38e6ed2323c31c0bd2b4e5a59696ebdd09524acaef15325"
+    },
+    {
+      "path": "net/dcsctp/tx/rr_send_queue.cc",
+      "base_sha256": "02b11ad2951255b95624c2fc3430d08c4bc7d5fdb19ae6736bd3a3cd8799ed6e",
+      "patched_sha256": "df3b36602e6f0e17cd065520e676aa0cd0198ac9db1cd114279edddb83680b8b"
+    },
+    {
+      "path": "net/dcsctp/socket/dcsctp_socket.cc",
+      "base_sha256": "e1dea184252ecae7e6fbb8c0274e6a6105ac6d6ae891f4f9a1509a8a7a55703f",
+      "patched_sha256": "3a024323a5ca24335ebafc9cbe7e72ad20bc21ef8278eab15bc9c0adc5bb9307"
+    },
+    {
+      "path": "media/sctp/dcsctp_transport.h",
+      "base_sha256": "e8f9e72101a2ac9001a4e658190f9dff606b83a71611c4227545afcf72360e96",
+      "patched_sha256": "1c213a05d1f42065d4e352afb0cba6ee243d81c0dfea94b54f9dac25c168680c"
+    },
+    {
+      "path": "media/sctp/dcsctp_transport.cc",
+      "base_sha256": "b5e2188abe2c99ff0b89a6a83248d7c3c2f7ea28a9ce7cbf23767ea8d12d2088",
+      "patched_sha256": "21de851c38d6f34ffa1b61cef12e485c44c243335b9762a8f946d28726be7f69"
+    },
+    {
+      "path": "api/portal_tx_channel_internal.h",
+      "base_sha256": null,
+      "patched_sha256": "f39ca05c665bd42e7e47af2afa9f31674c6303a50e6bb844a712e1625e5b9bcf"
+    },
+    {
+      "path": "pc/sctp_data_channel.cc",
+      "base_sha256": "66c5caf1a22b52eb3f826f230be98e4a5d6270b5c4fc01b14504eeca57623402",
+      "patched_sha256": "b33c302b8153d7bb0ebe3b4f2f4ea94fc51583a6659fcf0df8efdbf2dddfc4c8"
+    },
+    {
+      "path": "pc/sctp_data_channel.h",
+      "base_sha256": "e1c359845b31905cc7e5760491578f6ba3b5455473ba2bb299e1ea036ea7f48f",
+      "patched_sha256": "80e504f7d4d3160284252cb280c358a4e9465e201efae7939e659bda1c900e68"
+    }
+  ],
+  "archiver_sha256": "41861189eb10fb9fe73ffcb8c82bdbbe5f6084de78e03f15acddd1d33071c3a4",
+  "base_include_sha256": "4be3d4399f55dd02028104b0e28a6462bd7dc82786b0c306dcfc6e89c2a05175",
+  "helper_candidate_archive_sha256": "d4560bad345fbbc66d19980257570cfd03280db7343460ce8c76994f7e8ecc4a",
+  "rebuilt_archive_sha256": "bfc4153882f3976c62191c753eb848e91d9d0bdceca5c9b46545e8d7995e524e"
+}

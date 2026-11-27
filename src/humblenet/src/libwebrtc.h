@@ -67,6 +67,18 @@ int libwebrtc_write( struct libwebrtc_data_channel*, const void*, int len );
 void libwebrtc_close_channel( struct libwebrtc_data_channel* );
 void libwebrtc_close_connection( struct libwebrtc_connection* );
     
+#ifndef EMSCRIPTEN
+#include <stdint.h>
+struct lwrtc_portal_api {
+    uint32_t version;
+    uint64_t capabilities;
+    int (*enable)(struct libwebrtc_context *, void (*wake)(void *), void *user);
+    int (*write)(struct libwebrtc_data_channel *, const void *, int);
+    int (*reclaim)(struct libwebrtc_connection *);
+    uint64_t (*buffered)(struct libwebrtc_context *);
+};
+const struct lwrtc_portal_api *libwebrtc_portal_api(void);
+#endif
 #ifdef __cplusplus
 }
 #endif

@@ -1,6 +1,14 @@
 #include "../src/libwebrtc.h"
 
 #include <cstdio>
+#include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <chrono>
+#include <cstdlib>
+#include <set>
+#include <list>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -24,6 +32,19 @@
 #include "rtc_base/ssl_adapter.h"
 #include "rtc_base/thread.h"
 
+#include "api/task_queue/pending_task_safety_flag.h"
+#if __has_include("api/portal_tx_snapshot_v2.h")
+#include "api/portal_tx_snapshot_v2.h"
+static constexpr bool kPortalSdk = true;
+#else
+// Ordinary SDK without the portal overlay: no backend portal API, so portal enable refuses.
+#include "portal-sdk/portal_tx_snapshot_v2.h"
+int webrtc_portal_tx_observe_v2(void*, webrtc_portal_tx_notify_v2, void*, webrtc_portal_tx_snapshot_v2*) { return 0; }
+int webrtc_portal_tx_try_send_v2(void*, const void*, int, uint64_t, uint64_t) { return -1; }
+int webrtc_portal_tx_activate_v2(void*, uint64_t, uint64_t) { return -1; }
+static constexpr bool kPortalSdk = false;
+#endif
+
 #if defined(__GNUC__) || defined(__clang__)
 #define WEBRTC_EXPORT __attribute__((visibility("default")))
 #else
@@ -38,6 +59,15 @@ bool HasIPv6Enabled() {
 
 struct libwebrtc_connection;
 struct libwebrtc_data_channel;
+static constexpr uint64_t kPortalCapabilities = UINT64_C(0x1f);
+static constexpr uint64_t kPortalPeerBytes = 65536, kPortalGlobalBytes = 1048576;
+static constexpr uint64_t kPortalPeerRecords = 4096, kPortalGlobalRecords = 65536;
+// SDK-held ingress before the ring: 32 records per channel; the 1 MiB global cap bounds multi-channel peers.
+static constexpr uint32_t kPortalIngressRecords = 32;
+static constexpr uint64_t kPortalIngressBytes = 1048576;
+static void PortalWake(libwebrtc_context *ctx);
+static void PortalRemoveChannel(libwebrtc_data_channel *channel);
+static uint64_t PortalBuffered(libwebrtc_context *ctx);
 struct stored_ice_server {
 	libwebrtc_ice_server_type type = LIBWEBRTC_ICE_SERVER_STUN;
 	std::string url;
@@ -108,6 +138,27 @@ struct libwebrtc_context {
 	std::unique_ptr<rtc::Thread> signaling_thread;
 	std::unique_ptr<rtc::NetworkManager> network_manager;
 	std::unique_ptr<rtc::BasicPacketSocketFactory> packet_socket_factory;
+    bool portal = false;
+    std::atomic<bool> portal_snapshot_failed{false};
+    std::mutex portal_progress_mutex;
+    std::condition_variable portal_progress;
+    uint64_t portal_revision = 0;
+    void (*portal_wake)(void *) = nullptr;
+    void *portal_wake_user = nullptr;
+    struct Ledger {
+        libwebrtc_data_channel *channel;
+        libwebrtc_connection *owner;
+        uint64_t bytes = 0;
+        webrtc_portal_tx_snapshot_v2 snapshot = {};
+        bool bound = false;
+        bool activated = false, retire_task = false, activation_failed = false;
+        int snapshot_state = 1;
+        uint64_t in_progress_bytes = 0, in_progress_records = 0;
+    };
+    // Stable callback addresses; one record per reserved lifetime until terminal socket destruction.
+    std::list<Ledger> portal_ledger; // network-thread only
+    std::set<libwebrtc_connection *> portal_connections; // signaling-thread only
+    std::shared_ptr<std::atomic<uint64_t>> portal_ingress_bytes = std::make_shared<std::atomic<uint64_t>>(0);
 	bool zero_network_environment = false;
 	std::unordered_map<std::string, libwebrtc_connection*> zero_network_connections;
 
@@ -124,15 +175,21 @@ struct libwebrtc_data_channel : public webrtc::DataChannelObserver {
 	bool open_notified = false;
 	bool close_notified = false;
 	bool zero_network_synthetic = false;
+    // Portal: SDK callbacks arrive on the network thread and are posted to signaling here.
+    std::shared_ptr<std::atomic<uint32_t>> portal_ingress_records = std::make_shared<std::atomic<uint32_t>>(0);
+    webrtc::ScopedTaskSafety portal_safety;
 
 	libwebrtc_data_channel(libwebrtc_connection* parent,
 	                       webrtc::scoped_refptr<webrtc::DataChannelInterface> data_channel,
 	                       bool is_inbound);
 	~libwebrtc_data_channel() override;
 
+	bool IsOkToCallOnTheNetworkThread() override;
 	void OnStateChange() override;
 	void OnMessage(const webrtc::DataBuffer& buffer) override;
-	void OnBufferedAmountChange(uint64_t) override {}
+	void HandleState(webrtc::DataChannelInterface::DataState state);
+	void Deliver(const uint8_t* data, size_t size);
+	void OnBufferedAmountChange(uint64_t) override;
 	void NotifySyntheticOpen();
 	void NotifySyntheticClose();
 };
@@ -145,6 +202,9 @@ struct libwebrtc_connection : public webrtc::PeerConnectionObserver {
 	libwebrtc_connection* zero_network_peer = nullptr;
 	std::string local_ufrag;
 	std::string remote_ufrag;
+    bool portal_closing = false;
+    unsigned portal_observers = 0; // SDP observer lifetime, signaling-thread only
+    std::vector<std::unique_ptr<libwebrtc_data_channel>> portal_channels;
 	bool disconnected_notified = false;
 	bool destroy_notified = false;
 	bool established_notified = false;
@@ -158,6 +218,7 @@ struct libwebrtc_connection : public webrtc::PeerConnectionObserver {
 	}
 
 	void NotifyDestroyed() {
+        if (ctx && ctx->portal) { portal_closing = true; PortalWake(ctx); return; }
 		if(destroy_notified) {
 			return;
 		}
@@ -178,7 +239,7 @@ struct libwebrtc_connection : public webrtc::PeerConnectionObserver {
 	}
 
 	void MaybeRegisterZeroNetworkLocalDescription(const std::string& sdp) {
-		if(!ctx || !ctx->zero_network_environment) {
+		if(!ctx || ctx->portal || !ctx->zero_network_environment) {
 			return;
 		}
 		local_ufrag = ExtractIceUfrag(sdp);
@@ -232,7 +293,17 @@ struct libwebrtc_connection : public webrtc::PeerConnectionObserver {
 	}
 
 	void OnDataChannel(webrtc::scoped_refptr<webrtc::DataChannelInterface> channel) override {
+        if (ctx->portal && (!channel || portal_closing || !portal_channels.empty() ||
+            channel->ordered() || !channel->maxRetransmitsOpt().has_value() || *channel->maxRetransmitsOpt() != 0 ||
+            channel->maxPacketLifeTime().has_value())) {
+            if (channel) channel->Close();
+            CloseFromError("incompatible portal data-channel policy"); return;
+        }
 		auto* wrapper = new libwebrtc_data_channel(this, channel, true);
+        // Reserve pending OPEN_ACK before the SDK schedules OnTransportReady after this callback.
+        if (ctx->portal && PortalBuffered(ctx) == UINT64_MAX) {
+            CloseFromError("portal initial control ownership unavailable"); return;
+        }
 		if(channel && channel->state() == webrtc::DataChannelInterface::kOpen) {
 			wrapper->OnStateChange();
 		}
@@ -269,7 +340,7 @@ struct libwebrtc_connection : public webrtc::PeerConnectionObserver {
 
 	void OnIceGatheringChange(webrtc::PeerConnectionInterface::IceGatheringState new_state) override {
 		std::fprintf(stderr, "webrtc_native_linux: ice-gathering-state=%d\n", static_cast<int>(new_state));
-		if(new_state == webrtc::PeerConnectionInterface::kIceGatheringComplete && connection) {
+		if(!ctx->portal && new_state == webrtc::PeerConnectionInterface::kIceGatheringComplete && connection) {
 			const webrtc::SessionDescriptionInterface* desc = connection->local_description();
 			if(desc) {
 				std::string sdp;
@@ -290,7 +361,7 @@ struct libwebrtc_connection : public webrtc::PeerConnectionObserver {
 			NotifyError("ice-candidate-to-string");
 			return;
 		}
-		std::fprintf(stderr, "webrtc_native_linux: local-ice-candidate=%s\n", sdp.c_str());
+		std::fprintf(stderr, "webrtc_native_linux: local-ice-candidate=%s\n", ctx->portal ? "-" : sdp.c_str());
 		ctx->callback(ctx, this, nullptr, LWRTC_CALLBACK_ICE_CANDIDATE, user_data, (void*)sdp.c_str(), (int)sdp.size());
 	}
 
@@ -299,6 +370,7 @@ struct libwebrtc_connection : public webrtc::PeerConnectionObserver {
 	                         const std::string& url,
 	                         int error_code,
 	                         const std::string& error_text) override {
+        if (ctx && ctx->portal) { NotifyError("ice-candidate-error"); return; }
 		std::fprintf(stderr,
 		             "webrtc_native_linux: ice-candidate-error address=%s port=%d url=%s code=%d text=%s\n",
 		             address.c_str(),
@@ -322,12 +394,19 @@ libwebrtc_data_channel::libwebrtc_data_channel(libwebrtc_connection* parent,
 	, user_data(parent ? parent->user_data : nullptr)
 	, channel(std::move(data_channel))
 	, inbound(is_inbound) {
+    if (connection && connection->ctx->portal) {
+        connection->portal_channels.emplace_back(this);
+        connection->ctx->network_thread->BlockingCall([&] {
+            connection->ctx->portal_ledger.push_back({this, connection});
+        });
+    }
 	if(channel) {
 		channel->RegisterObserver(this);
 	}
 }
 
 libwebrtc_data_channel::~libwebrtc_data_channel() {
+    if (connection && connection->ctx && connection->ctx->portal) PortalRemoveChannel(this);
 	if(channel) {
 		channel->UnregisterObserver();
 	}
@@ -365,18 +444,29 @@ void libwebrtc_data_channel::NotifySyntheticClose() {
 		(int)zero_network_label.size());
 }
 
+bool libwebrtc_data_channel::IsOkToCallOnTheNetworkThread() { return connection && connection->ctx->portal; }
+
 void libwebrtc_data_channel::OnStateChange() {
+    if (channel && connection && connection->ctx->portal && connection->ctx->network_thread->IsCurrent()) {
+        connection->ctx->signaling_thread->PostTask(webrtc::SafeTask(portal_safety.flag(),
+            [this, state = channel->state()] { HandleState(state); }));
+        return;
+    }
+    if (channel) HandleState(channel->state());
+}
+
+void libwebrtc_data_channel::HandleState(webrtc::DataChannelInterface::DataState state) {
 	if(!connection || !connection->ctx || !connection->ctx->callback || !channel) {
 		return;
 	}
 
 	std::fprintf(stderr,
 	             "webrtc_native_linux: data-channel-state label=%s state=%d inbound=%d\n",
-	             channel->label().c_str(),
-	             static_cast<int>(channel->state()),
+	             connection->ctx->portal ? "-" : channel->label().c_str(),
+	             static_cast<int>(state),
 	             inbound ? 1 : 0);
 
-	switch(channel->state()) {
+	switch(state) {
 		case webrtc::DataChannelInterface::kOpen: {
 			if(open_notified) {
 				return;
@@ -398,6 +488,7 @@ void libwebrtc_data_channel::OnStateChange() {
 				return;
 			}
 			close_notified = true;
+            if (connection->ctx->portal) connection->portal_closing = true;
 			const std::string label = channel->label();
 			connection->ctx->callback(
 				connection->ctx,
@@ -407,7 +498,7 @@ void libwebrtc_data_channel::OnStateChange() {
 				user_data,
 				label.empty() ? nullptr : (void*)label.c_str(),
 				(int)label.size());
-			delete this;
+			if (!connection->ctx->portal) delete this;
 			break;
 		}
 		default:
@@ -415,7 +506,35 @@ void libwebrtc_data_channel::OnStateChange() {
 	}
 }
 
+// Holds one SDK message's ingress reservation until delivery to the ring or task cancellation.
+struct PortalIngressHold {
+    std::shared_ptr<std::atomic<uint32_t>> records;
+    std::shared_ptr<std::atomic<uint64_t>> bytes;
+    uint64_t size;
+    PortalIngressHold(std::shared_ptr<std::atomic<uint32_t>> r, std::shared_ptr<std::atomic<uint64_t>> b, uint64_t n)
+        : records(std::move(r)), bytes(std::move(b)), size(n) { ++*records; *bytes += size; }
+    PortalIngressHold(PortalIngressHold &&) = default;
+    ~PortalIngressHold() { if (records) { --*records; *bytes -= size; } }
+};
+
 void libwebrtc_data_channel::OnMessage(const webrtc::DataBuffer& buffer) {
+    auto *ctx = connection ? connection->ctx : nullptr;
+    if (!ctx || !ctx->portal || !ctx->network_thread->IsCurrent()) return Deliver(buffer.data.cdata(), buffer.size());
+    // Network thread: no humblenet locks. Only reservations on this thread add, so the check cannot race.
+    const size_t size = buffer.size(), kept = size >= 1 && size <= 1400 ? size : 0;
+    // ponytail: uncounted drop; ingress_pressure lives in libhumblenet, counting needs an lwrtc_portal_api field.
+    if (*portal_ingress_records >= kPortalIngressRecords || *ctx->portal_ingress_bytes + kept > kPortalIngressBytes) return;
+    ctx->signaling_thread->PostTask(webrtc::SafeTask(portal_safety.flag(),
+        [this, hold = PortalIngressHold(portal_ingress_records, ctx->portal_ingress_bytes, kept),
+         data = kept ? buffer.data : rtc::CopyOnWriteBuffer(), size] { Deliver(data.cdata(), size); }));
+}
+
+void libwebrtc_data_channel::Deliver(const uint8_t* data, size_t size) {
+    if (connection && connection->ctx->portal && (size < 1 || size > 1400)) {
+        connection->ctx->callback(connection->ctx, connection, this, LWRTC_CALLBACK_CHANNEL_RECEIVE,
+            user_data, nullptr, size > 1400 ? 1401 : 0);
+        return;
+    }
 	if(!connection || !connection->ctx || !connection->ctx->callback) {
 		return;
 	}
@@ -426,18 +545,20 @@ void libwebrtc_data_channel::OnMessage(const webrtc::DataBuffer& buffer) {
 		this,
 		LWRTC_CALLBACK_CHANNEL_RECEIVE,
 		user_data,
-		(void*)buffer.data.data(),
-		(int)buffer.size())) {
-		if(channel) {
-			channel->Close();
-		}
+		(void*)data,
+		(int)size)) {
+        if (connection->ctx->portal) {
+            connection->portal_closing = true;
+            connection->NotifyDisconnected(); PortalWake(connection->ctx);
+        } else if (channel) channel->Close();
 	}
 }
 
 class SetLocalDescriptionObserver : public webrtc::SetLocalDescriptionObserverInterface {
 public:
 	explicit SetLocalDescriptionObserver(libwebrtc_connection* connection)
-		: connection_(connection) {}
+		: connection_(connection) { if (connection_->ctx->portal) ++connection_->portal_observers; }
+    ~SetLocalDescriptionObserver() override { if (connection_->ctx->portal) { --connection_->portal_observers; PortalWake(connection_->ctx); } }
 
 	void OnSetLocalDescriptionComplete(webrtc::RTCError error) override {
 		if(!error.ok()) {
@@ -456,7 +577,8 @@ class CreateDescriptionObserver : public webrtc::CreateSessionDescriptionObserve
 public:
 	CreateDescriptionObserver(libwebrtc_connection* connection, webrtc::SdpType expected_type)
 		: connection_(connection)
-		, expected_type_(expected_type) {}
+		, expected_type_(expected_type) { if (connection_->ctx->portal) ++connection_->portal_observers; }
+    ~CreateDescriptionObserver() override { if (connection_->ctx->portal) { --connection_->portal_observers; PortalWake(connection_->ctx); } }
 
 	void OnSuccess(webrtc::SessionDescriptionInterface* desc) override {
 		if(!connection_ || !connection_->connection || !connection_->ctx || !connection_->ctx->callback || !desc) {
@@ -514,7 +636,8 @@ public:
 
 	SetRemoteDescriptionObserver(libwebrtc_connection* connection, Action action)
 		: connection_(connection)
-		, action_(action) {}
+		, action_(action) { if (connection_->ctx->portal) ++connection_->portal_observers; }
+    ~SetRemoteDescriptionObserver() override { if (connection_->ctx->portal) { --connection_->portal_observers; PortalWake(connection_->ctx); } }
 
 	void OnSetRemoteDescriptionComplete(webrtc::RTCError error) override {
 		if(!error.ok()) {
@@ -525,7 +648,7 @@ public:
 			return;
 		}
 
-		if(!connection_ || !connection_->connection) {
+		if(!connection_ || !connection_->connection || (connection_->ctx->portal && connection_->portal_closing)) {
 			return;
 		}
 
@@ -577,6 +700,196 @@ webrtc::PeerConnectionInterface::RTCConfiguration BuildRtcConfig(const libwebrtc
 	return config;
 }
 
+static void PortalWake(libwebrtc_context *ctx) {
+    { std::lock_guard<std::mutex> lock(ctx->portal_progress_mutex); ++ctx->portal_revision; }
+    ctx->portal_progress.notify_all();
+    if (ctx->portal_wake) ctx->portal_wake(ctx->portal_wake_user);
+}
+static void PortalRemoveChannel(libwebrtc_data_channel *channel) {
+    auto *ctx = channel->connection->ctx;
+    ctx->network_thread->BlockingCall([&] {
+        auto &ledger = ctx->portal_ledger;
+        for (auto it = ledger.begin(); it != ledger.end(); ++it) {
+            if (it->channel != channel) continue;
+            if (it->bound) { it->channel = nullptr; break; }
+            ledger.erase(it); break;
+        }
+    });
+    PortalWake(ctx);
+}
+void libwebrtc_data_channel::OnBufferedAmountChange(uint64_t) {
+    if (connection && connection->ctx->portal) PortalWake(connection->ctx);
+}
+static void PortalSnapshot(void *user, const webrtc_portal_tx_snapshot_v2 *snapshot, int state) {
+    auto *record = static_cast<libwebrtc_context::Ledger *>(user);
+    record->snapshot_state = snapshot && (state == 1 || state == 2) ? state : 0;
+    if (record->snapshot_state) {
+        record->snapshot = *snapshot;
+        record->bytes = snapshot->owned_payload_bytes;
+    }
+    if (!record->snapshot_state) record->owner->ctx->portal_snapshot_failed.store(true);
+    // SDK network callback: store absolute state and wake only; no SDK reentry or destruction.
+    PortalWake(record->owner->ctx);
+}
+static bool PortalPotential(libwebrtc_context *ctx, uint64_t &bytes, uint64_t &records) {
+    bytes = records = 0;
+    for (const auto &r : ctx->portal_ledger) {
+        if (!r.snapshot_state || r.snapshot.owned_payload_bytes > r.snapshot.reservation_bytes ||
+            r.snapshot.owned_records > r.snapshot.reservation_records ||
+            r.snapshot.reservation_bytes > UINT64_MAX - r.in_progress_bytes ||
+            r.snapshot.reservation_records > UINT64_MAX - r.in_progress_records) return false;
+        const auto b = (r.activated ? r.snapshot.reservation_bytes : r.snapshot.owned_payload_bytes) + r.in_progress_bytes;
+        const auto n = (r.activated ? r.snapshot.reservation_records : r.snapshot.owned_records) + r.in_progress_records;
+        if (b > UINT64_MAX - bytes || n > UINT64_MAX - records) return false;
+        bytes += b; records += n;
+    }
+    return true;
+}
+static void PortalActivate(libwebrtc_context *ctx, libwebrtc_context::Ledger &r) {
+    if (!r.bound || r.activated || r.activation_failed || !r.channel || !r.channel->channel) return;
+    uint64_t used_bytes, used_records;
+    const auto &s = r.snapshot;
+    if (!PortalPotential(ctx, used_bytes, used_records) || s.reservation_bytes < s.owned_payload_bytes ||
+        s.reservation_records < s.owned_records) {
+        ctx->portal_snapshot_failed.store(true); return;
+    }
+    const auto added_bytes = s.reservation_bytes - s.owned_payload_bytes;
+    const auto added_records = s.reservation_records - s.owned_records;
+    int result = 0;
+    if (s.reservation_bytes <= kPortalPeerBytes && s.reservation_records <= kPortalPeerRecords &&
+        added_bytes <= kPortalGlobalBytes && added_records <= kPortalGlobalRecords &&
+        used_bytes <= kPortalGlobalBytes - added_bytes && used_records <= kPortalGlobalRecords - added_records) {
+        const auto bytes = std::min(kPortalPeerBytes, s.owned_payload_bytes + kPortalGlobalBytes - used_bytes);
+        const auto records = std::min(kPortalPeerRecords, s.owned_records + kPortalGlobalRecords - used_records);
+        r.in_progress_bytes = added_bytes; r.in_progress_records = added_records;
+        result = webrtc_portal_tx_activate_v2(r.channel->channel.get(), bytes, records);
+        r.in_progress_bytes = r.in_progress_records = 0;
+        if (result == 1 && r.snapshot_state == 1 && s.reservation_bytes <= bytes &&
+            s.reservation_records <= records) { r.activated = true; return; }
+    }
+    // Keep this exact callback context alive until the queued scoped close has run.
+    r.activation_failed = r.retire_task = true;
+    auto *record = &r;
+    ctx->signaling_thread->PostTask([ctx, record] {
+        record->owner->CloseFromError("portal initial control reservation refused");
+        ctx->network_thread->BlockingCall([record] { record->retire_task = false; });
+        PortalWake(ctx);
+    });
+}
+static uint64_t PortalRefresh(libwebrtc_context *ctx) {
+    if (ctx->portal_snapshot_failed.load()) return UINT64_MAX;
+    uint64_t total = 0;
+    for (auto &r : ctx->portal_ledger) {
+        if (!r.bound && r.channel && r.channel->channel) {
+            webrtc_portal_tx_snapshot_v2 snapshot = {};
+            if (!webrtc_portal_tx_observe_v2(r.channel->channel.get(), PortalSnapshot, &r, &snapshot)) {
+                ctx->portal_snapshot_failed.store(true);
+                return UINT64_MAX;
+            }
+            r.bound = true; r.snapshot_state = 1; r.snapshot = snapshot;
+            r.bytes = snapshot.owned_payload_bytes;
+        }
+        PortalActivate(ctx, r);
+        if (!r.snapshot_state || UINT64_MAX - total < r.bytes) {
+            ctx->portal_snapshot_failed.store(true); return UINT64_MAX;
+        }
+        total += r.bytes;
+    }
+    return total;
+}
+static int PortalEnable(libwebrtc_context *ctx, void (*wake)(void *), void *user) {
+    if (!ctx || ctx->portal || !wake) return 0;
+    ctx->portal_wake = wake; ctx->portal_wake_user = user; ctx->portal = true;
+    return 1;
+}
+static int PortalWrite(libwebrtc_data_channel *wrapper, const void *data, int length) {
+    if (!wrapper || !data || length < 1 || length > 1400) return -1;
+    auto *ctx = wrapper->connection->ctx;
+    if (!ctx->portal || wrapper->zero_network_synthetic) return -1;
+    // scoped ref survives a synchronous channel close; wrapper stays owned until explicit reclaim.
+    auto channel = wrapper->channel;
+    if (!channel) return -1;
+    return ctx->network_thread->BlockingCall([&] {
+        if (channel->state() != webrtc::DataChannelInterface::kOpen) return -1;
+        const auto total = PortalRefresh(ctx);
+        auto it = std::find_if(ctx->portal_ledger.begin(), ctx->portal_ledger.end(), [&](const auto &r) { return r.channel == wrapper; });
+        if (it == ctx->portal_ledger.end()) return -1;
+        if (total == UINT64_MAX || !it->bound || it->snapshot_state != 1) return -1;
+        if (!it->activated) return it->activation_failed ? -1 : 0;
+        // SDK proof: a queued original prepays its complete fragment family, including restart.
+        const uint64_t added_bytes = 2u * static_cast<uint64_t>(length);
+        const uint64_t added_records = static_cast<uint64_t>(length) + 1;
+        uint64_t used_bytes, used_records;
+        if (!PortalPotential(ctx, used_bytes, used_records)) {
+            ctx->portal_snapshot_failed.store(true); return -1;
+        }
+        if (it->in_progress_bytes || it->in_progress_records ||
+            it->snapshot.reservation_bytes > kPortalPeerBytes - added_bytes ||
+            it->snapshot.reservation_records > kPortalPeerRecords - added_records ||
+            used_bytes > kPortalGlobalBytes - added_bytes || used_records > kPortalGlobalRecords - added_records) return 0;
+        const auto byte_ceiling = std::min(kPortalPeerBytes, it->snapshot.reservation_bytes + kPortalGlobalBytes - used_bytes);
+        const auto record_ceiling = std::min(kPortalPeerRecords, it->snapshot.reservation_records + kPortalGlobalRecords - used_records);
+        it->in_progress_bytes = added_bytes; it->in_progress_records = added_records;
+        const int result = webrtc_portal_tx_try_send_v2(channel.get(), data, length, byte_ceiling, record_ceiling);
+        // A synchronous snapshot may already include this send; hold the transaction through return.
+        it->in_progress_bytes = it->in_progress_records = 0;
+        if (it->snapshot_state != 1 || it->snapshot.reservation_bytes > byte_ceiling ||
+            it->snapshot.reservation_records > record_ceiling) return -1;
+        return result;
+    });
+}
+static int PortalReclaim(libwebrtc_connection *connection) {
+    if (!connection || !connection->ctx->portal) return 0;
+    auto *ctx = connection->ctx;
+    return ctx->signaling_thread->BlockingCall([&] {
+        if (!connection->portal_closing) return 0;
+        if (connection->connection) {
+            connection->connection->Close();
+            connection->bootstrap_channel = nullptr;
+            connection->connection = nullptr;
+        }
+        connection->portal_channels.clear();
+        if (!ctx->network_thread->BlockingCall([&] {
+            for (const auto &r : ctx->portal_ledger)
+                if (r.owner == connection && (r.retire_task || (r.bound && r.snapshot_state != 2))) return false;
+            ctx->portal_ledger.remove_if([&](const auto &r) { return r.owner == connection; });
+            return true;
+        })) return 0;
+        if (connection->portal_observers) return 0;
+        ctx->portal_connections.erase(connection);
+        connection->destroy_notified = true;
+        ctx->callback(ctx, connection, nullptr, LWRTC_CALLBACK_DESTROY, connection->user_data, nullptr, 0);
+        delete connection;
+        return 1;
+    });
+}
+static void PortalDrainContext(libwebrtc_context *ctx) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    // Reuse exact close/reclaim while SDP callbacks and their owning threads can still run.
+    while (true) {
+        uint64_t revision;
+        { std::lock_guard<std::mutex> lock(ctx->portal_progress_mutex); revision = ctx->portal_revision; }
+        auto pending = ctx->signaling_thread->BlockingCall([&] {
+            return std::vector<libwebrtc_connection *>(ctx->portal_connections.begin(), ctx->portal_connections.end());
+        });
+        if (pending.empty()) return;
+        for (auto *connection : pending) {
+            libwebrtc_close_connection(connection);
+            PortalReclaim(connection);
+        }
+        if (ctx->signaling_thread->BlockingCall([&] { return ctx->portal_connections.empty(); })) return;
+        std::unique_lock<std::mutex> lock(ctx->portal_progress_mutex);
+        if (!ctx->portal_progress.wait_until(lock, deadline, [&] { return revision != ctx->portal_revision; })) {
+            // Never destroy a context beneath live callback references, even at shutdown.
+            std::fprintf(stderr, "portal shutdown failed: backend callback retirement deadline exceeded\n");
+            std::abort();
+        }
+    }
+}
+static uint64_t PortalBuffered(libwebrtc_context *ctx) {
+    if (!ctx || !ctx->portal) return 0;
+    return ctx->network_thread->BlockingCall([&] { return PortalRefresh(ctx); });
+}
 extern "C" {
 
 WEBRTC_EXPORT struct libwebrtc_context* libwebrtc_create_context(lwrtc_callback_function callback) {
@@ -640,6 +953,7 @@ WEBRTC_EXPORT void libwebrtc_destroy_context(struct libwebrtc_context* ctx) {
 		return;
 	}
 
+    if (ctx->portal) PortalDrainContext(ctx);
 	ctx->factory = nullptr;
 	if(ctx->signaling_thread) {
 		ctx->signaling_thread->Stop();
@@ -682,6 +996,7 @@ WEBRTC_EXPORT struct libwebrtc_connection* libwebrtc_create_connection_extended(
 
 	bool create_ok = false;
 	ctx->signaling_thread->BlockingCall([&] {
+        if (ctx->portal && (ctx->portal_connections.size() >= 160 || ctx->portal_snapshot_failed.load())) return;
 		webrtc::PeerConnectionDependencies dependencies(connection.get());
 		auto allocator = std::make_unique<cricket::BasicPortAllocator>(
 			ctx->network_manager.get(),
@@ -707,6 +1022,7 @@ WEBRTC_EXPORT struct libwebrtc_connection* libwebrtc_create_connection_extended(
 
 		connection->connection = std::move(error_or_peer_connection.value());
 		create_ok = true;
+        if (ctx->portal) ctx->portal_connections.insert(connection.get());
 	});
 
 	if(!create_ok || !connection->connection) {
@@ -720,7 +1036,7 @@ WEBRTC_EXPORT struct libwebrtc_data_channel* libwebrtc_create_channel(struct lib
 		return nullptr;
 	}
 
-	if(connection->ctx->zero_network_environment && connection->zero_network_peer) {
+	if(!connection->ctx->portal && connection->ctx->zero_network_environment && connection->zero_network_peer) {
 		auto* outbound = new libwebrtc_data_channel(connection, nullptr, false);
 		auto* inbound = new libwebrtc_data_channel(connection->zero_network_peer, nullptr, true);
 		const std::string label = name ? name : "default";
@@ -812,7 +1128,7 @@ WEBRTC_EXPORT int libwebrtc_set_offer(struct libwebrtc_connection* connection, c
 		std::unique_ptr<webrtc::SessionDescriptionInterface> description =
 			webrtc::CreateSessionDescription(webrtc::SdpType::kOffer, sdp, &error);
 		if(!description) {
-			std::fprintf(stderr, "webrtc_native_linux: set-offer parse error at '%s': %s\n", error.line.c_str(), error.description.c_str());
+			std::fprintf(stderr, "webrtc_native_linux: set-offer parse error at '%s': %s\n", connection->ctx->portal ? "-" : error.line.c_str(), connection->ctx->portal ? "-" : error.description.c_str());
 			return;
 		}
 
@@ -836,7 +1152,7 @@ WEBRTC_EXPORT int libwebrtc_set_answer(struct libwebrtc_connection* connection, 
 		std::unique_ptr<webrtc::SessionDescriptionInterface> description =
 			webrtc::CreateSessionDescription(webrtc::SdpType::kAnswer, sdp, &error);
 		if(!description) {
-			std::fprintf(stderr, "webrtc_native_linux: set-answer parse error at '%s': %s\n", error.line.c_str(), error.description.c_str());
+			std::fprintf(stderr, "webrtc_native_linux: set-answer parse error at '%s': %s\n", connection->ctx->portal ? "-" : error.line.c_str(), connection->ctx->portal ? "-" : error.description.c_str());
 			return;
 		}
 
@@ -859,12 +1175,12 @@ WEBRTC_EXPORT int libwebrtc_add_ice_candidate(struct libwebrtc_connection* conne
 		std::unique_ptr<webrtc::IceCandidateInterface> ice(
 			webrtc::CreateIceCandidate("0", 0, candidate, &error));
 		if(!ice) {
-			std::fprintf(stderr, "webrtc_native_linux: add-ice-candidate parse error at '%s': %s\n", error.line.c_str(), error.description.c_str());
+			std::fprintf(stderr, "webrtc_native_linux: add-ice-candidate parse error at '%s': %s\n", connection->ctx->portal ? "-" : error.line.c_str(), connection->ctx->portal ? "-" : error.description.c_str());
 			return;
 		}
 
 		const bool added = connection->connection->AddIceCandidate(ice.get());
-		std::fprintf(stderr, "webrtc_native_linux: add-ice-candidate added=%d candidate=%s\n", added ? 1 : 0, candidate);
+		std::fprintf(stderr, "webrtc_native_linux: add-ice-candidate added=%d candidate=%s\n", added ? 1 : 0, connection->ctx->portal ? "-" : candidate);
 		if(added) {
 			ok = 1;
 		}
@@ -873,6 +1189,10 @@ WEBRTC_EXPORT int libwebrtc_add_ice_candidate(struct libwebrtc_connection* conne
 }
 
 WEBRTC_EXPORT int libwebrtc_write(struct libwebrtc_data_channel* channel, const void* data, int len) {
+    if (channel && channel->connection->ctx->portal) {
+        const int result = PortalWrite(channel, data, len);
+        return result > 0 ? len : result;
+    }
 	if(!channel || !data || len < 0) {
 		return -1;
 	}
@@ -931,8 +1251,15 @@ WEBRTC_EXPORT void libwebrtc_close_connection(struct libwebrtc_connection* conne
 	}
 
 	connection->ctx->signaling_thread->BlockingCall([&] {
+        if (connection->ctx->portal) connection->portal_closing = true;
 		connection->connection->Close();
+        if (connection->ctx->portal) PortalWake(connection->ctx);
 	});
+}
+
+WEBRTC_EXPORT const struct lwrtc_portal_api *libwebrtc_portal_api() {
+    static const struct lwrtc_portal_api api = {1, kPortalCapabilities, PortalEnable, PortalWrite, PortalReclaim, PortalBuffered};
+    return kPortalSdk ? &api : nullptr;
 }
 
 }

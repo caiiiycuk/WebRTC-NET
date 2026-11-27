@@ -1,5 +1,6 @@
 // CORE
 #include "humblenet_core.cpp"
+#include "humblenet_portal.cpp"
 // Datagram
 #include "humblenet_datagram.cpp"
 // P2P

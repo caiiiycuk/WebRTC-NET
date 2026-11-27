@@ -7,6 +7,8 @@
 #include "humblenet_p2p_signaling.h"
 
 #include <memory>
+#include <atomic>
+#include <cassert>
 #include <deque>
 #include <functional>
 #include <unordered_map>
@@ -71,6 +73,7 @@ typedef enum ConnectionStatus {
 struct Connection {
 	InOrOut inOrOut;
 	ConnectionStatus status;
+	uint64_t lifetime;
 
 	// peerId of the other peer
 	// 0 if not a p2p connection
@@ -89,6 +92,9 @@ struct Connection {
 	, writable(true)
 	, socket(NULL)
 	{
+		static std::atomic<uint64_t> serial(1);
+		lifetime = serial.fetch_add(1, std::memory_order_relaxed);
+		assert(lifetime);
 	}
 };
 

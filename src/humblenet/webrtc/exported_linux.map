@@ -1,5 +1,6 @@
 {
 global:
+    libwebrtc_portal_api;
     libwebrtc_create_context;
     libwebrtc_destroy_context;
     libwebrtc_set_ice_servers;

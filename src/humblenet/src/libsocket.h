@@ -42,6 +42,9 @@ struct internal_callbacks_t {
 
 internal_context_t* internal_init(internal_callbacks_t*);
 void internal_deinit(internal_context_t*);
+int internal_portal_write(internal_socket_t *, const void *, unsigned int);
+int internal_portal_reclaim(internal_socket_t *);
+unsigned long long internal_portal_buffered(internal_context_t *);
 void internal_publish_context(internal_context_t*);
     
 bool internal_supports_webRTC( internal_context_t *);

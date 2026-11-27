@@ -1,3 +1,4 @@
+#include "humblenet_portal_internal.h"
 #include "humblenet_p2p.h"
 #include "humblenet_p2p_internal.h"
 #include "humblenet_datagram.h"
@@ -74,7 +75,10 @@ ha_bool HUMBLENET_CALL humblenet_p2p_init(const char* server, const char* game_t
 	}
 
 	initialized = true;
-	humblenet_signaling_connect();
+ if (!humblenet_signaling_connect()) {
+  humblenet_p2p_shutdown();
+  return 0;
+ }
 
 	return 1;
 }
@@ -90,6 +94,8 @@ void humblenet_p2p_shutdown() {
 		HUMBLENET_GUARD();
 
 		if (!initialized) {
+            // Portal enable owns an eventfd before P2P initialization.
+            portal_shutdown();
 			return;
 		}
 
@@ -107,6 +113,7 @@ void humblenet_p2p_shutdown() {
 	}
 
 	internal_deinit(context);
+    portal_shutdown();
 
 	humbleNetState.myPeerId = 0;
 	humbleNetState.reconnectPeerId = 0;
@@ -186,6 +193,7 @@ HUMBLENET_API ha_bool HUMBLENET_CALL humblenet_p2p_alias_query(const char* query
  * Send a message to a peer.
  */
 int HUMBLENET_CALL humblenet_p2p_sendto(const void* message, uint32_t length, PeerId topeer, SendMode sendmode, uint8_t channel) {
+    if (portal_enabled()) { humblenet_set_error("Use lifetime-scoped portal_send"); return -1; }
 	P2P_INIT_GUARD( -1 );
 
 	HUMBLENET_GUARD();
@@ -214,7 +222,11 @@ int HUMBLENET_CALL humblenet_p2p_sendto(const void* message, uint32_t length, Pe
 		LOG("Connection to peer opened: %u\n", topeer );
 	}
 
-	int flags = 0;
+	if (humblenet_connection_status(conn) == HUMBLENET_CONNECTION_CLOSED) {
+  humblenet_set_error("Connection to peer was closed");
+  return -1;
+ }
+ int flags = 0;
 
 	if( sendmode & SEND_RELIABLE_BUFFERED )
 		flags = HUMBLENET_MSG_BUFFERED;
@@ -258,7 +270,9 @@ ha_bool HUMBLENET_CALL humblenet_p2p_peek(uint32_t* length, uint8_t channel) {
 /*
  * Receive a message sent from a peer
  */
-int HUMBLENET_CALL humblenet_p2p_recvfrom(void* buffer, uint32_t length, PeerId* frompeer, uint8_t channel) {
+static int p2p_recvfrom(void* buffer, uint32_t length, PeerId* frompeer, uint8_t channel, uint64_t* lifetime) {
+    if (portal_enabled()) { humblenet_set_error("Use timestamped portal_recv"); return 0; }
+	if (lifetime) *lifetime = 0;
 	P2P_INIT_GUARD( 0 );
 
 	HUMBLENET_GUARD();
@@ -268,6 +282,7 @@ int HUMBLENET_CALL humblenet_p2p_recvfrom(void* buffer, uint32_t length, PeerId*
 	if( !conn || !ret ) {
 		*frompeer = 0;
 	} else {
+		if (lifetime) *lifetime = conn->lifetime;
 		PeerId vpeer = internal_alias_get_virtual_peer( conn );
 		PeerId peer = conn->otherPeer;
 
@@ -283,13 +298,68 @@ int HUMBLENET_CALL humblenet_p2p_recvfrom(void* buffer, uint32_t length, PeerId*
 				p2pconnections.insert( std::make_pair( *frompeer, conn ) );
 			}
 		} else {
-			p2pconnections.erase( *frompeer );
-			p2pconnections.erase( peer );
+			// A queued close belongs to this object, not a replacement with the same PeerId.
+			for (auto it = p2pconnections.begin(); it != p2pconnections.end(); ) {
+				if (it->second == conn) it = p2pconnections.erase(it);
+				else ++it;
+			}
 			humblenet_connection_close(conn);
 			LOG("closing connection to peer: %u(%u)\n",*frompeer,peer);
 		}
 	}
 	return ret;
+}
+
+int HUMBLENET_CALL humblenet_p2p_recvfrom(void* buffer, uint32_t length, PeerId* peer, uint8_t channel) {
+ return p2p_recvfrom(buffer, length, peer, channel, nullptr);
+}
+int HUMBLENET_CALL humblenet_dz_recvfrom(void* buffer, uint32_t length, PeerId* peer, uint8_t channel, uint64_t* lifetime) {
+ return p2p_recvfrom(buffer, length, peer, channel, lifetime);
+}
+int HUMBLENET_CALL humblenet_dz_connection_state(PeerId peer, uint64_t* lifetime) {
+ HUMBLENET_GUARD();
+ *lifetime = 0;
+ auto it = p2pconnections.find(peer);
+ if (it == p2pconnections.end()) return 0;
+ *lifetime = it->second->lifetime;
+ return it->second->status;
+}
+ha_bool HUMBLENET_CALL humblenet_dz_disconnect(PeerId peer, uint64_t lifetime) {
+ P2P_INIT_GUARD(false);
+ HUMBLENET_GUARD();
+ auto it = p2pconnections.find(peer);
+ if (!lifetime || it == p2pconnections.end() || it->second->lifetime != lifetime) return false;
+ humblenet_connection_set_closed(it->second);
+ return true;
+}
+
+// Observe the native provider's existing session and alias fences; counters stay uint64.
+int HUMBLENET_CALL humblenet_dz_signaling_state(uint64_t* generation) {
+ HUMBLENET_GUARD();
+ *generation = humbleNetState.reconnectGeneration;
+ if (!initialized) return 0;
+ if (humbleNetState.myPeerId && humbleNetState.p2pConn && humbleNetState.p2pConn->wsi) return 2;
+ return humbleNetState.reconnectScheduled ? 3 : 1;
+}
+int HUMBLENET_CALL humblenet_dz_alias_state(const char* alias, PeerId* peer, uint64_t* generation) {
+ HUMBLENET_GUARD();
+ *peer = 0;
+ *generation = humbleNetState.reconnectGeneration;
+ if (!initialized) return 5;
+ if (!alias || !humbleNetState.desiredAliases.count(alias)) return 0;
+ if (humbleNetState.confirmedAliases.count(alias) && humbleNetState.myPeerId &&
+     humbleNetState.p2pConn && humbleNetState.p2pConn->wsi) {
+  *peer = humbleNetState.myPeerId;
+  return 2;
+ }
+ return 1;
+}
+PeerId HUMBLENET_CALL humblenet_dz_route_for_peer(PeerId peer) {
+ HUMBLENET_GUARD();
+ PeerId route = 0;
+ for (auto& it : p2pconnections)
+  if (it.second->otherPeer == peer && (!route || internal_alias_is_virtual_peer(it.first))) route = it.first;
+ return route;
 }
 
 /*

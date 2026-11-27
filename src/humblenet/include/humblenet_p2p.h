@@ -9,6 +9,7 @@
 #endif
 
 #include "humblenet.h"
+#include "humblenet_portal.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,6 +28,14 @@ typedef enum SendMode {
 * Is the peer-to-peer network supported on this platform.
 */
 HUMBLENET_API ha_bool HUMBLENET_CALL humblenet_p2p_supported();
+
+HUMBLENET_API int HUMBLENET_CALL humblenet_dz_signaling_state(uint64_t* generation);
+HUMBLENET_API int HUMBLENET_CALL humblenet_dz_alias_state(const char* alias, PeerId* peer, uint64_t* generation);
+HUMBLENET_API PeerId HUMBLENET_CALL humblenet_dz_route_for_peer(PeerId peer);
+HUMBLENET_API const char* HUMBLENET_CALL humblenet_dz_backend_path(void);
+HUMBLENET_API int HUMBLENET_CALL humblenet_dz_connection_state(PeerId peer, uint64_t* lifetime);
+HUMBLENET_API int HUMBLENET_CALL humblenet_dz_recvfrom(void* buffer, uint32_t length, PeerId* peer, uint8_t channel, uint64_t* lifetime);
+HUMBLENET_API ha_bool HUMBLENET_CALL humblenet_dz_disconnect(PeerId peer, uint64_t lifetime);
 	
 /*
 * Initialize the peer-to-peer library.
