@@ -508,6 +508,11 @@ static ha_bool p2pSignalProcess(const humblenet::HumblePeer::Message *msg, void 
 				HUMBLENET_UNGUARD();
 				connection->socket = internal_create_webrtc(humbleNetState.context);
 			}
+			if( ! connection->socket ) {
+				humblenet_connection_close( connection );
+				sendPeerRefused(humbleNetState.p2pConn.get(), peer);
+				break;
+			}
 			internal_set_data( connection->socket, connection );
 
 			humbleNetState.pendingPeerConnectionsIn.insert(std::make_pair(peer, connection));

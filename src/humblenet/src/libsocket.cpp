@@ -621,6 +621,10 @@ internal_socket_t* internal_create_webrtc(internal_context_t* ctx) {
 	socket->context = ctx;
 
 	socket->webrtc = libwebrtc_create_connection_extended( ctx->webrtc, socket );
+	if( ! socket->webrtc ) {
+		delete socket;
+		return NULL;
+	}
 	socket->callbacks = ctx->callbacks;
 
 	return socket;

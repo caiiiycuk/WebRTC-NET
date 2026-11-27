@@ -658,13 +658,15 @@ void internal_alias_resolved_to( const std::string& alias, PeerId peer ) {
 
 		humblenet_connection_set_closed(connection);
 	} else {
-		int ret;
+		int ret = 0;
 		{
 			HUMBLENET_UNGUARD();
 			connection->socket = internal_create_webrtc(humbleNetState.context);
-			internal_set_data( connection->socket, connection);
+			if( connection->socket ) {
+				internal_set_data( connection->socket, connection);
 
-			ret = internal_create_offer(connection->socket );
+				ret = internal_create_offer(connection->socket );
+			}
 		}
 
 		if( !ret) {
